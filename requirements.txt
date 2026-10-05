@@ -1,0 +1,31 @@
+# ClipMind dependencies.
+#
+# Phase 1 (capture + storage):
+pyperclip>=1.8,<2
+
+# Phase 2 (local embeddings) -- fully offline after the one-time model download.
+#
+# These four are pinned to the newest combination that works with torch 2.2.2,
+# which is the last PyTorch release with macOS x86_64 (Intel) wheels. There,
+# sentence-transformers 6.x needs transformers >= 5.x, which needs torch >= 2.5,
+# and torch 2.2.2 is linked against NumPy 1.x.
+#
+# On Linux / Apple Silicon / Windows, where torch >= 2.5 is available, you can
+# relax these to:  numpy>=2  scipy>=1.14  sentence-transformers>=4  transformers>=5
+numpy>=1.26,<2
+scipy>=1.13,<1.14
+transformers==4.48.3
+sentence-transformers==3.4.1
+
+# Phase 3 (time-aware hybrid search): no new dependencies.
+# Time parsing is a hand-written stdlib `re` parser (search/timeparse.py) and
+# keyword search uses SQLite's built-in FTS5/BM25. `dateparser` is deliberately
+# not used: it eagerly reads "monday.com" as a weekday and a bare "5pm" as a
+# filter, which is exactly the misfire Phase 3 must avoid.
+
+# Phase 4/5 (privacy + desktop UI):
+# pynput>=1.7
+# PySide6>=6.7
+
+# Development / tests:
+pytest>=8.0

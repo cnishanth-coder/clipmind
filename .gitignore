@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+*.spec
+
+# Local ClipMind data (never commit captured clipboard content)
+*.db
+*.db-wal
+*.db-shm
+data/
