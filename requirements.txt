@@ -23,7 +23,11 @@ sentence-transformers==3.4.1
 # not used: it eagerly reads "monday.com" as a weekday and a bare "5pm" as a
 # filter, which is exactly the misfire Phase 3 must avoid.
 
-# Phase 4/5 (privacy + desktop UI):
+# Phase 4 (privacy filters + config): no new dependencies.
+# Secret detection is regex + validation, and config.toml is read with the
+# Python 3.11+ standard-library `tomllib`.
+
+# Phase 5 (desktop UI):
 # pynput>=1.7
 # PySide6>=6.7
 

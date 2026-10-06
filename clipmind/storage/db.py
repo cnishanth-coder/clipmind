@@ -26,6 +26,9 @@ from ..config import Config
 #: Bump when the on-disk schema changes in an incompatible way.
 SCHEMA_VERSION = 1
 
+#: ``meta`` key holding the persisted pause flag (``"1"`` when paused).
+PAUSED_META_KEY = "paused"
+
 #: Columns of the ``items`` table, in display order.
 _ITEM_COLUMNS = (
     "id, content, content_type, source_app, created_at, content_hash, embedding"
@@ -126,7 +129,8 @@ class InsertResult:
     Attributes:
         inserted: True when a new row was written.
         reason: One of ``"inserted"``, ``"duplicate"``, ``"empty"``,
-            ``"too_long"`` or ``"invalid"``.
+            ``"too_long"``, ``"invalid"``, ``"ignored"`` (source-app ignore
+            list) or ``"secret"`` (a skip-configured secret was detected).
         record: The stored record when ``inserted`` is True, else ``None``.
         duplicate_of: Id of the existing row when ``reason == "duplicate"``.
     """
@@ -332,11 +336,72 @@ class Database(AbstractContextManager["Database"]):
             return int(count)
 
     def delete_by_id(self, item_id: int) -> bool:
-        """Delete one entry by id; return True when a row was removed."""
+        """Delete one entry by id; return True when a row was removed.
+
+        The ``items_ad`` trigger removes the row from the FTS5 index, so a
+        deleted entry stops matching keyword/hybrid search immediately.
+        """
         with self._lock:
             cursor = self._conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
             self._conn.commit()
             return cursor.rowcount > 0
+
+    def delete_older_than(self, cutoff: datetime | str) -> int:
+        """Delete every entry created strictly before ``cutoff``.
+
+        Args:
+            cutoff: Boundary instant; naive datetimes are treated as UTC.
+
+        Returns:
+            The number of rows deleted. The FTS index is kept in sync by the
+            ``items_ad`` trigger on each deleted row.
+        """
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM items WHERE created_at < ?",
+                (self._coerce_timestamp(cutoff),),
+            )
+            self._conn.commit()
+            return int(cursor.rowcount)
+
+    def vacuum(self) -> None:
+        """Rebuild the database file, reclaiming space after bulk deletes.
+
+        ``VACUUM`` rewrites the whole file and can be slow on a large database,
+        so callers run it only after a bulk delete (purge/clear), never per row.
+        """
+        with self._lock:
+            self._conn.commit()
+            self._conn.execute("VACUUM")
+            self._conn.commit()
+
+    # --------------------------------------------------------------- meta flags
+
+    def get_meta(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Return the value stored under ``key`` in the ``meta`` table."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            ).fetchone()
+        return row["value"] if row else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        """Insert or update a ``meta`` value."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    def is_paused(self) -> bool:
+        """Return True when the persisted pause flag is set."""
+        return self.get_meta(PAUSED_META_KEY, "0") == "1"
+
+    def set_paused(self, paused: bool) -> None:
+        """Persist the pause flag so ``watch`` can honour it live."""
+        self.set_meta(PAUSED_META_KEY, "1" if paused else "0")
 
     def set_embedding(self, item_id: int, embedding: bytes) -> bool:
         """Attach a serialised embedding to an existing row (Phase 2 hook)."""

@@ -16,12 +16,12 @@ embedding-model download, and no telemetry of any kind.
 | ----- | ----- | ----- |
 | **1** | Clipboard capture, SQLite storage, dedup, CLI | ✅ done |
 | **2** | Local embeddings (`all-MiniLM-L6-v2`), background worker, semantic search via CLI | ✅ done |
-| **3** | Hybrid search (semantic + FTS5 BM25) + time-aware query parsing | ✅ **done (this release)** |
-| 4 | Privacy filters (secret detection, ignore list, retention) + `config.toml` | planned |
+| **3** | Hybrid search (semantic + FTS5 BM25) + time-aware query parsing | ✅ done |
+| **4** | Privacy filters (secret detection, ignore list, retention) + `config.toml` | ✅ **done (this release)** |
 | 5 | PySide6 popup UI, global hotkey, tray icon | planned |
 | 6 | Benchmark script + PyInstaller packaging | planned (test suite exists) |
 
-Current version: **0.3.0** (Phase 3).
+Current version: **0.4.0** (Phase 4).
 
 ---
 
@@ -85,9 +85,9 @@ and full-text indexing, all driven from the command line.
 └────────────────────┘           │
                                  │ writes float32 BLOBs
                     ┌────────────▼────────────────┐
-                    │  privacy/  (Phase 4)        │
-                    │  secret masking, ignore     │
-                    │  list, retention            │
+                    │  privacy/                   │
+                    │  detectors + policy +       │
+                    │  ignore list + retention    │
                     └─────────────────────────────┘
 ```
 
@@ -425,7 +425,7 @@ CLIPMIND_CANDIDATE_POOL=20       # candidates each retriever contributes before 
 The day-part windows and the week start are `Config` fields
 (`day_part_morning=(5, 12)`, `day_part_afternoon=(12, 17)`,
 `day_part_evening=(17, 21)`, `day_part_night=(21, 5)`, `week_starts_on=0`).
-Editing them without code - via `config.toml` - arrives in Phase 4.
+Edit them in `config.toml` (see the Privacy & configuration section below).
 
 ---
 
@@ -441,8 +441,8 @@ Editing them without code - via `config.toml` - arrives in Phase 4.
 | Content type | `url` / `email` / `number` / `code` / `text`, by heuristic (see `capture/detect.py`). |
 
 `config.py` holds the defaults (`max_chars`, `oversize_policy`, `poll_interval`,
-`dedup`) and reads `CLIPMIND_*` environment overrides. A `config.toml` file
-arrives in Phase 4.
+`dedup`). An optional `config.toml` overrides them, and `CLIPMIND_*` environment
+variables override the file (see the Privacy & configuration section below).
 
 ---
 
@@ -479,18 +479,63 @@ ClipMind is local-first by construction:
 * **You can inspect it.** It is a normal SQLite database:
   `sqlite3 ~/Library/Application\ Support/clipmind/clipmind.db "select * from items"`.
 
-Delivered in Phase 4: API-key / JWT / credit-card / PEM-private-key detection
-with skip-or-mask, a source-application ignore list (e.g. never capture from a
-password manager), a **Clear all history** action, and auto-delete after N days.
+Phase 4 adds a privacy layer at the capture boundary. Everything runs locally,
+and no detected value is ever written to a log.
 
-Note that Phase 1 already has the building blocks: `source_app` is stored on
-every row, `Database.delete_all()` wipes history (and rebuilds the FTS index),
-and `CLIPMIND_SOURCE_APP` lets you verify app attribution before the ignore
-list exists.
+### What is detected
 
-> **Caveat:** until Phase 4 ships, a secret you copy *is* stored in plain text
-> in the local database. Do not run ClipMind while handling credentials you do
-> not want written to disk.
+| Category | `kind` | Default action |
+| -------- | ------ | -------------- |
+| PEM private-key blocks | `private_key` | **skip** |
+| Credit-card numbers (13-19 digits, **Luhn-checked**) | `credit_card` | **skip** |
+| Password-like assignments (`password=...`, `secret: ...`) | `password` | **skip** |
+| AWS access key ids (`AKIA...` / `ASIA...`) | `aws_access_key` | mask |
+| GitHub tokens (`ghp_...`, `github_pat_...`) | `github_token` | mask |
+| Slack tokens (`xoxb-...`) | `slack_token` | mask |
+| OpenAI/Anthropic keys (`sk-...`) | `openai_key` | mask |
+| Google API keys (`AIza...`) | `google_api_key` | mask |
+| JSON Web Tokens | `jwt` | mask |
+
+**skip** means the entry is not stored at all. **mask** stores it with the
+secret replaced by `[REDACTED:<kind>]`. The masked text is what gets hashed,
+embedded and indexed, so the raw secret never reaches the database, the FTS5
+index, or the embedding model.
+
+Detection is **best-effort, not a guarantee**: it recognises the shapes above
+and nothing more. Ordinary text - UUIDs, git hashes, phone numbers, order IDs,
+timestamps - is deliberately not flagged; card numbers must pass Luhn and JWTs
+must decode to a header with `alg`, which keeps false positives low.
+
+```toml
+# config.toml
+privacy_enabled = true
+[secret_actions]
+aws_access_key = "mask"
+credit_card = "skip"
+```
+
+### Source-application ignore list
+
+Captures from a configurable list of apps are skipped entirely (defaults:
+1Password, Bitwarden, KeePassXC, Keychain Access, LastPass). Matching is
+case-insensitive and substring-based. This relies on knowing the frontmost app,
+which on macOS needs `pyobjc` and is otherwise empty - so treat it as
+defence-in-depth, not a guarantee (see Limitations).
+
+### Pause, data management, retention
+
+```bash
+clipmind pause                 # stop capturing; a running watch honours it live
+clipmind resume
+clipmind status                # pause state + database summary
+clipmind delete 42             # remove one entry (its FTS row goes with it)
+clipmind clear --yes           # wipe everything (prompts without --yes)
+clipmind purge --older-than 30d
+```
+
+Set `retention_days` in `config.toml` to auto-purge old entries on watcher
+startup and once a day. Bulk deletes run `VACUUM`, and the FTS5 delete triggers
+keep the keyword index exact.
 
 ---
 
@@ -498,7 +543,7 @@ list exists.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest              # 230 passed, 6 skipped, ~3s, no model, no network
+python -m pytest              # 369 passed, 6 skipped, ~4s, no model, no network
 python -m pytest --runslow    # + 6 integration tests against the real model
 ```
 
@@ -511,7 +556,10 @@ embedding worker (including a test that the capture loop does **not** block on a
 slow embedder), reindex eligibility/idempotence/progress, the time-phrase parser
 (including the ambiguous `monday.com` case), FTS5 query sanitising and BM25
 normalisation, hybrid fusion (weights, merge-by-id, the exact-keyword threshold
-bypass, and date pre-filtering), and every CLI command.
+bypass, and date pre-filtering), secret detection and the skip/mask policy
+(including assertions that a masked secret never reaches the DB, the FTS index
+or the embedding input), the source-app ignore list, pause/resume, retention
+purge, `config.toml` loading/validation, and every CLI command.
 
 The six `slow` integration tests load the real `all-MiniLM-L6-v2`. Three cover
 semantic ranking: `"database query"` ranks `SELECT id FROM orders;` first,
@@ -548,7 +596,7 @@ finds the SQL entry.
 
 ---
 
-## Limitations (through Phase 2)
+## Limitations (through Phase 4)
 
 * **Text only.** No images, files or rich content.
 * **Foreground process.** `watch` must be running; it is not yet a service. The
@@ -587,6 +635,15 @@ finds the SQL entry.
   reports the embeddings as failed instead of dying.
 * **No encryption at rest.** The SQLite file is protected only by filesystem
   permissions.
+* **Secret detection is best-effort.** The detectors match known credential
+  shapes; a secret in an unlisted format is stored unmasked. Treat masking as a
+  safety net, not a guarantee.
+* **The source-app ignore list needs app detection.** On macOS without
+  `pyobjc`, and on Linux/Windows generally, the frontmost app is usually
+  unknown, so the ignore list cannot fire - the secret detectors still run.
+* **`clear`/`purge` rewrite the database with `VACUUM`.** That is a hard delete
+  as far as SQLite is concerned, but it is not a secure erase of free space on
+  disk; use full-disk encryption if that matters to you.
 
 ---
 
@@ -616,7 +673,9 @@ clipmind/
 │   │   ├── keyword.py       # FTS5 BM25 searcher + MATCH sanitising
 │   │   ├── hybrid.py        # HybridSearcher, weighted fusion, --explain breakdown
 │   │   └── timeparse.py     # deterministic time phrase -> local date window
-│   ├── privacy/             # Phase 4 (placeholder)
+│   ├── privacy/
+│   │   ├── detectors.py     # regex detectors + Luhn/JWT validation
+│   │   └── policy.py        # skip/mask policy, masking, ignore list
 │   └── ui/                  # Phase 5 (placeholder)
 ├── tests/                   # pytest suite
 ├── requirements.txt
@@ -633,7 +692,7 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # --- Phase 1: capture + storage (fast, no model) ---
-python -m pytest                       # 230 passed, 6 skipped
+python -m pytest                       # 369 passed, 6 skipped
 export CLIPMIND_DB=/tmp/clipmind_demo.db
 python -m clipmind add "SELECT id FROM orders;"
 python -m clipmind add "https://react.dev/learn"
@@ -660,6 +719,18 @@ python -m clipmind search "database query" --explain  # FINAL / SEM / KW / COV b
 python -m clipmind search "react hooks article yesterday"
 python -m clipmind search "yesterday"                 # everything from yesterday, newest first
 python -m clipmind search "monday.com link"           # reported as ambiguous, not filtered
+
+# --- Phase 4: privacy + data management ---
+python -m clipmind add "password=hunter2"           # -> Not stored (secret).
+python -m clipmind add "my key AKIAIOSFODNN7EXAMPLE"
+python -m clipmind list                             # key [REDACTED:aws_access_key]
+python -m clipmind pause                            # a running watch stops storing
+python -m clipmind status
+python -m clipmind resume
+python -m clipmind purge --older-than 30d
+python -m clipmind config path                      # ~/.config/clipmind/config.toml
+python -m clipmind config show
+python -m clipmind config show --template           # documented defaults
 
 # --- live capture with automatic embedding ---
 python -m clipmind watch     # in one tab; copy things in another app

@@ -7,6 +7,11 @@ and stores the result via :class:`~clipmind.storage.db.Database`.
 
 The reader is injected, so tests and the demo script can drive the monitor
 without touching a real clipboard.
+
+Phase 4 layers on, in order: the persisted pause flag (checked every poll so a
+running watcher honours ``pause``/``resume`` live), the source-app ignore list,
+and the secret policy. When a secret is masked, the *masked* text is what gets
+hashed, embedded and indexed; when it is configured to skip, nothing is stored.
 """
 
 from __future__ import annotations
@@ -14,15 +19,21 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timedelta
 from typing import Optional, Protocol
 
 from ..config import Config
 from ..embeddings.service import EmbeddingService
-from ..storage.db import ClipRecord, Database, InsertResult
+from ..privacy.policy import PrivacyFilter
+from ..storage.db import ClipRecord, Database, InsertResult, hash_content, utcnow
+from .detect import detect_content_type
 from .processor import ClipProcessor, ProcessedClip
 from .source_app import frontmost_app_name
 
 logger = logging.getLogger(__name__)
+
+#: ``meta`` key recording the last retention sweep, so it runs at most daily.
+_LAST_PURGE_META_KEY = "last_purge_at"
 
 
 class ClipboardReader(Protocol):
@@ -65,6 +76,7 @@ class ClipboardMonitor:
         reader: Optional[ClipboardReader] = None,
         processor: Optional[ClipProcessor] = None,
         embedding_service: Optional[EmbeddingService] = None,
+        privacy: Optional[PrivacyFilter] = None,
         capture_initial: bool = False,
         detect_source_app: bool = True,
     ) -> None:
@@ -72,12 +84,15 @@ class ClipboardMonitor:
 
         Args:
             db: Open database used for storage.
-            config: Configuration (poll interval, max length, dedup).
+            config: Configuration (poll interval, max length, dedup, privacy).
             reader: Clipboard reader; defaults to :class:`PyperclipReader`.
             processor: Text processor; defaults to a fresh :class:`ClipProcessor`.
             embedding_service: Optional background embedder. When supplied, each
                 newly stored entry is queued for embedding; the clipboard poll
                 never waits for the model. The caller owns its lifecycle.
+            privacy: Secret/ignore-list filter; defaults to one built from
+                ``config``. Every stored entry passes through it, and the
+                *masked* text is what gets hashed, embedded and indexed.
             capture_initial: When False (default) the value already on the
                 clipboard at startup is ignored, so launching ClipMind does not
                 re-store stale content.
@@ -89,12 +104,21 @@ class ClipboardMonitor:
         self.reader = reader or PyperclipReader()
         self.processor = processor or ClipProcessor(self.config)
         self.embedding_service = embedding_service
+        self.privacy = privacy or PrivacyFilter(self.config)
         self.detect_source_app = detect_source_app
 
         self.capture_initial = capture_initial
         self._last_seen: Optional[str] = None
         self._seeded = False
-        self._stats = {"polls": 0, "new": 0, "duplicates": 0, "skipped": 0}
+        self._stats = {
+            "polls": 0,
+            "new": 0,
+            "duplicates": 0,
+            "skipped": 0,
+            "ignored": 0,
+            "secrets": 0,
+            "paused": 0,
+        }
 
     # ------------------------------------------------------------------ stats
 
@@ -120,25 +144,50 @@ class ClipboardMonitor:
             The :class:`InsertResult`, or ``None`` when the text was empty or
             rejected by the oversize policy.
         """
+        if self.privacy.ignored(source_app):
+            # Never capture from a password manager / keychain, even if the
+            # frontmost app was only matched loosely. Logs stay value-free.
+            self._stats["ignored"] += 1
+            logger.debug("ignoring capture from a configured source app")
+            return InsertResult(False, "ignored")
+
         processed: Optional[ProcessedClip] = self.processor.process(text, source_app)
         if processed is None:
             self._stats["skipped"] += 1
             return None
 
+        content = processed.content
+        content_type = processed.content_type
+        content_hash = processed.content_hash
+
+        outcome = self.privacy.evaluate(content)
+        if outcome.skipped:
+            self._stats["secrets"] += 1
+            logger.info("skipped an entry containing a configured secret (%s)", outcome.describe())
+            return InsertResult(False, "secret")
+        if outcome.masked:
+            # The masked text is what gets hashed, embedded and indexed, so the
+            # raw secret never reaches the DB, the FTS index or the model.
+            self._stats["secrets"] += 1
+            content = outcome.content
+            content_type = detect_content_type(content)
+            content_hash = hash_content(content)
+
         result = self.db.insert_clip(
-            content=processed.content,
-            content_type=processed.content_type,
+            content=content,
+            content_type=content_type,
             source_app=processed.source_app,
-            content_hash=processed.content_hash,
+            content_hash=content_hash,
         )
         if result.inserted:
             self._stats["new"] += 1
             logger.info(
-                "captured %s entry #%s (%d chars)%s",
-                processed.content_type,
+                "captured %s entry #%s (%d chars)%s%s",
+                content_type,
                 result.record.id if result.record else "?",
-                len(processed.content),
+                len(content),
                 " [truncated]" if processed.truncated else "",
+                " [redacted]" if outcome.masked else "",
             )
             self._queue_embedding(result.record)
         else:
@@ -162,6 +211,11 @@ class ClipboardMonitor:
             when nothing changed.
         """
         self._stats["polls"] += 1
+        if self.db.is_paused():
+            # Honour the persisted pause flag live: skip the read entirely so
+            # nothing is captured until `clipmind resume` clears it.
+            self._stats["paused"] += 1
+            return None
         try:
             value = self.reader.paste()
         except Exception as exc:
@@ -190,6 +244,42 @@ class ClipboardMonitor:
         """Return the frontmost application name, or ``None`` when disabled."""
         return frontmost_app_name() if self.detect_source_app else None
 
+    # -------------------------------------------------------------- retention
+
+    def purge_expired(self, *, force: bool = False) -> int:
+        """Delete entries older than ``Config.retention_days``, when configured.
+
+        Runs once at watcher startup (``force=True``) and then at most once
+        every 24 hours, so a long-running ``watch`` enforces retention daily.
+
+        Args:
+            force: Ignore the once-a-day guard and purge now.
+
+        Returns:
+            The number of rows deleted. ``VACUUM`` runs after the delete.
+        """
+        days = self.config.retention_days
+        if not days:
+            return 0
+        now = utcnow()
+        if not force:
+            last = self.db.get_meta(_LAST_PURGE_META_KEY)
+            if last:
+                try:
+                    last_dt: Optional[datetime] = datetime.fromisoformat(last)
+                except ValueError:
+                    last_dt = None
+                if last_dt is not None and (now - last_dt) < timedelta(hours=24):
+                    return 0
+        removed = self.db.delete_older_than(now - timedelta(days=days))
+        self.db.vacuum()
+        self.db.set_meta(_LAST_PURGE_META_KEY, now.isoformat())
+        if removed:
+            logger.info(
+                "retention: purged %d entr(y/ies) older than %d day(s)", removed, days
+            )
+        return removed
+
     # ----------------------------------------------------------------- loop
 
     def run(
@@ -213,9 +303,17 @@ class ClipboardMonitor:
             self.db.path,
         )
         try:
+            self.purge_expired(force=True)
+        except Exception:  # retention must never block capture
+            logger.exception("retention sweep failed")
+        try:
             while not stop_event.is_set():
                 if max_iterations is not None and iterations >= max_iterations:
                     break
+                try:
+                    self.purge_expired()
+                except Exception:  # retention must never block capture
+                    logger.exception("retention sweep failed")
                 try:
                     self.poll_once()
                 except Exception:  # keep the daemon alive on transient errors

@@ -8,6 +8,12 @@ Commands::
     clipmind search "<query>"    # hybrid (semantic + keyword) search
     clipmind reindex             # embed entries that have no embedding yet
     clipmind stats               # database summary
+    clipmind pause | resume      # toggle capture without restarting watch
+    clipmind status              # pause state + database summary
+    clipmind delete <id>         # remove one entry (and its FTS row)
+    clipmind clear [--yes]       # remove everything (confirmation required)
+    clipmind purge --older-than 30d
+    clipmind config show|path    # effective configuration / its location
 
 ``search`` understands time phrases inline (``"react hooks yesterday"``) and
 accepts ``--top``, ``--type``, ``--min-score``, ``--explain``, ``--semantic-only``
@@ -21,12 +27,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
+from dataclasses import fields as dataclass_fields
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
 from .. import __version__
-from ..config import Config
+from ..config import (
+    Config,
+    ConfigError,
+    config_file_path,
+    default_config_toml,
+)
 from ..embeddings.encoder import EmbeddingModelUnavailable
 from ..embeddings.service import EmbeddingService, reindex_pending
 from ..search.hybrid import HybridOutcome, HybridResult, hybrid_search
@@ -171,6 +185,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("stats", help="Show database summary.")
+
+    sub.add_parser("pause", help="Stop capturing new clipboard entries.")
+    sub.add_parser("resume", help="Resume capturing after `clipmind pause`.")
+    sub.add_parser("status", help="Show pause state and a database summary.")
+
+    delete = sub.add_parser("delete", help="Delete one stored entry by id.")
+    delete.add_argument("id", type=int, help="Entry id (see `clipmind list`).")
+
+    clear = sub.add_parser("clear", help="Delete every stored entry.")
+    clear.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt."
+    )
+
+    purge = sub.add_parser("purge", help="Delete entries older than a duration.")
+    purge.add_argument(
+        "--older-than", default=None, metavar="DURATION",
+        help="Age threshold such as 30d, 12h or 2w (default: retention_days).",
+    )
+
+    cfg = sub.add_parser("config", help="Inspect the effective configuration.")
+    cfg_sub = cfg.add_subparsers(dest="config_command", required=True)
+    cfg_show = cfg_sub.add_parser("show", help="Print the effective configuration.")
+    cfg_show.add_argument(
+        "--template", action="store_true",
+        help="Print a documented config.toml template with the defaults instead.",
+    )
+    cfg_sub.add_parser("path", help="Print the config.toml location.")
     return parser
 
 
@@ -247,6 +288,7 @@ def cmd_watch(args: argparse.Namespace, config: Config) -> int:
         )
         try:
             if args.once:
+                monitor.purge_expired(force=True)
                 monitor.poll_once()
                 print(f"Polled once. {monitor.stats}")
                 return 0
@@ -511,6 +553,171 @@ def cmd_stats(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+# ------------------------------------------------------- pause / data / config
+
+_DURATION_RE = re.compile(r"^\s*(\d+)\s*([dhw]|days?|hours?|weeks?)?\s*$", re.IGNORECASE)
+
+
+def parse_duration(text: str) -> timedelta:
+    """Parse a short duration such as ``30d``, ``12h`` or ``2w``.
+
+    Args:
+        text: The duration string. A bare number means days.
+
+    Raises:
+        ValueError: When ``text`` is not a recognised duration.
+    """
+    match = _DURATION_RE.match(text or "")
+    if match is None:
+        raise ValueError(f"invalid duration {text!r} (try 30d, 12h or 2w)")
+    amount = int(match.group(1))
+    unit = (match.group(2) or "d").lower()
+    if unit in {"h", "hour", "hours"}:
+        return timedelta(hours=amount)
+    if unit in {"w", "week", "weeks"}:
+        return timedelta(weeks=amount)
+    return timedelta(days=amount)
+
+
+def cmd_pause(args: argparse.Namespace, config: Config) -> int:
+    """Persist the paused flag; a running watcher honours it immediately."""
+    with Database(config=config) as db:
+        db.set_paused(True)
+    print("Capture paused. New clipboard entries will not be stored.")
+    print("Run `clipmind resume` to start capturing again.")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace, config: Config) -> int:
+    """Clear the paused flag."""
+    with Database(config=config) as db:
+        db.set_paused(False)
+    print("Capture resumed.")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace, config: Config) -> int:
+    """Print the pause state plus a compact database summary."""
+    with Database(config=config) as db:
+        paused = db.is_paused()
+        total = db.count()
+        indexed = db.indexed_fingerprint()[0]
+        missing = db.count_missing_embeddings()
+        db_path = db.path
+    print(f"State: {'paused' if paused else 'running'}")
+    print(f"Database: {db_path}")
+    print(f"Total entries: {total}")
+    print(f"Embedded: {indexed}  (awaiting embedding: {missing})")
+    if config.retention_days:
+        print(f"Retention: delete entries older than {config.retention_days} day(s)")
+    else:
+        print("Retention: disabled")
+    return 0
+
+
+def cmd_delete(args: argparse.Namespace, config: Config) -> int:
+    """Delete one entry by id (the FTS row goes with it via the delete trigger)."""
+    with Database(config=config) as db:
+        if not db.delete_by_id(args.id):
+            print(f"No entry with id {args.id}.", file=sys.stderr)
+            return 1
+    print(f"Deleted #{args.id}.")
+    return 0
+
+
+def cmd_clear(args: argparse.Namespace, config: Config) -> int:
+    """Delete every entry, after confirmation unless ``--yes`` is given."""
+    with Database(config=config) as db:
+        total = db.count()
+        db_path = db.path
+        if not args.yes:
+            if not sys.stdin.isatty():
+                print(
+                    "Refusing to clear without --yes (standard input is not a terminal).",
+                    file=sys.stderr,
+                )
+                return 2
+            answer = input(f"Delete all {total} entr(y/ies) from {db_path}? [y/N] ")
+            if answer.strip().lower() not in {"y", "yes"}:
+                print("Aborted; nothing was deleted.")
+                return 0
+        removed = db.delete_all()
+        db.vacuum()
+    print(f"Cleared {removed} entr(y/ies).")
+    return 0
+
+
+def cmd_purge(args: argparse.Namespace, config: Config) -> int:
+    """Delete entries older than ``--older-than`` (or ``retention_days``)."""
+    label = args.older_than
+    try:
+        if args.older_than:
+            delta = parse_duration(args.older_than)
+        elif config.retention_days:
+            delta = timedelta(days=config.retention_days)
+            label = f"{config.retention_days}d"
+        else:
+            print(
+                "error: --older-than DURATION is required (or set retention_days).",
+                file=sys.stderr,
+            )
+            return 2
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    cutoff = utcnow() - delta
+    with Database(config=config) as db:
+        removed = db.delete_older_than(cutoff)
+        db.vacuum()
+    print(f"Purged {removed} entr(y/ies) older than {label}.")
+    return 0
+
+
+def _format_value(value: object) -> str:
+    """Render a config value for ``config show``."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(str(item) for item in value) + "]"
+    return str(value)
+
+
+def format_config(config: Config) -> str:
+    """Return the effective configuration as aligned ``key = value`` lines."""
+    lines = [f"config file: {config_file_path()}"]
+    lines.append("")
+    for spec in dataclass_fields(config):
+        value = getattr(config, spec.name)
+        if spec.name == "secret_actions":
+            lines.append("secret_actions:")
+            for kind in sorted(value):
+                lines.append(f"  {kind} = {value[kind]}")
+            continue
+        if spec.name == "embedding_skip_types":
+            value = sorted(value)
+        elif spec.name == "ignore_source_apps":
+            value = list(value)
+        lines.append(f"{spec.name} = {_format_value(value)}")
+    return "\n".join(lines)
+
+
+def cmd_config(args: argparse.Namespace, config: Config) -> int:
+    """``config show`` / ``config path``."""
+    if args.config_command == "path":
+        path = config_file_path()
+        print(path)
+        print("exists" if path.exists() else "not found (defaults are in use)")
+        return 0
+    if getattr(args, "template", False):
+        print(default_config_toml(), end="")
+        return 0
+    print(format_config(config))
+    return 0
+
+
 _COMMANDS = {
     "watch": cmd_watch,
     "list": cmd_list,
@@ -518,6 +725,13 @@ _COMMANDS = {
     "search": cmd_search,
     "reindex": cmd_reindex,
     "stats": cmd_stats,
+    "pause": cmd_pause,
+    "resume": cmd_resume,
+    "status": cmd_status,
+    "delete": cmd_delete,
+    "clear": cmd_clear,
+    "purge": cmd_purge,
+    "config": cmd_config,
 }
 
 
@@ -532,7 +746,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         datefmt="%H:%M:%S",
     )
 
-    config = Config.from_env()
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if args.db:
         config = config.with_overrides(db_path=Path(args.db))
 

@@ -38,3 +38,13 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip_slow)
+
+
+@pytest.fixture(autouse=True)
+def isolate_user_config(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Point ``config.toml`` at a per-test path so the suite is hermetic.
+
+    Without this, ``Config.load()`` (used by the CLI) could pick up a real
+    ``~/.config/clipmind/config.toml`` from the machine running the tests.
+    """
+    monkeypatch.setenv("CLIPMIND_CONFIG", str(tmp_path / "clipmind-test-config.toml"))
