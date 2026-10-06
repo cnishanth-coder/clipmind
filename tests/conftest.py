@@ -2,16 +2,22 @@
 
 * Makes ``clipmind`` and the local ``fakes`` module importable from the repo root.
 * Gates ``@pytest.mark.slow`` tests (the ones that load the real
-   ``all-MiniLM-L6-v2`` model) behind ``--runslow``, so the default suite stays
-   fast and offline.
+  ``all-MiniLM-L6-v2`` model) behind ``--runslow``, so the default suite stays
+  fast and offline.
+* Forces Qt onto the ``offscreen`` platform plugin before any PySide6 import,
+  so the popup smoke test runs inside a terminal/CI with no display.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+# Must be set before Qt is imported; keep a real platform if one was requested.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent

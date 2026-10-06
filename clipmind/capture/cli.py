@@ -14,6 +14,7 @@ Commands::
     clipmind clear [--yes]       # remove everything (confirmation required)
     clipmind purge --older-than 30d
     clipmind config show|path    # effective configuration / its location
+    clipmind app                 # desktop app: popup + tray + global hotkey
 
 ``search`` understands time phrases inline (``"react hooks yesterday"``) and
 accepts ``--top``, ``--type``, ``--min-score``, ``--explain``, ``--semantic-only``
@@ -202,6 +203,26 @@ def build_parser() -> argparse.ArgumentParser:
     purge.add_argument(
         "--older-than", default=None, metavar="DURATION",
         help="Age threshold such as 30d, 12h or 2w (default: retention_days).",
+    )
+
+    app = sub.add_parser(
+        "app",
+        help="Run the desktop app: popup, tray icon and global hotkey.",
+    )
+    app.add_argument(
+        "--no-hotkey", action="store_true",
+        help="Do not register the global hotkey (tray only).",
+    )
+    app.add_argument(
+        "--no-tray", action="store_true", help="Do not create the tray icon."
+    )
+    app.add_argument(
+        "--no-embed", action="store_true",
+        help="Do not start the embedding service (keyword-only search).",
+    )
+    app.add_argument(
+        "--check", action="store_true",
+        help="Build the app, print a summary and exit without running it.",
     )
 
     cfg = sub.add_parser("config", help="Inspect the effective configuration.")
@@ -704,6 +725,37 @@ def format_config(config: Config) -> str:
     return "\n".join(lines)
 
 
+def cmd_app(args: argparse.Namespace, config: Config) -> int:
+    """Run (or ``--check``) the desktop app.
+
+    PySide6/pynput are imported lazily so the rest of the CLI keeps working
+    without the optional UI dependencies installed.
+    """
+    try:
+        from ..ui.app import run_app
+    except ImportError as exc:
+        print(
+            "error: the desktop UI needs PySide6 and pynput, which are not "
+            "installed.",
+            file=sys.stderr,
+        )
+        print(
+            "Install them with `pip install -r requirements.txt` (or "
+            "`pip install PySide6 pynput`).",
+            file=sys.stderr,
+        )
+        if args.verbose:
+            print(f"  ({exc})", file=sys.stderr)
+        return 1
+    return run_app(
+        config,
+        enable_hotkey=not args.no_hotkey,
+        enable_tray=not args.no_tray,
+        enable_embedding=not args.no_embed,
+        check=args.check,
+    )
+
+
 def cmd_config(args: argparse.Namespace, config: Config) -> int:
     """``config show`` / ``config path``."""
     if args.config_command == "path":
@@ -732,6 +784,7 @@ _COMMANDS = {
     "clear": cmd_clear,
     "purge": cmd_purge,
     "config": cmd_config,
+    "app": cmd_app,
 }
 
 

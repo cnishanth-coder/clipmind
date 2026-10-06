@@ -244,6 +244,23 @@ class ClipboardMonitor:
         """Return the frontmost application name, or ``None`` when disabled."""
         return frontmost_app_name() if self.detect_source_app else None
 
+    def remember_clipboard(self, text: Optional[str]) -> None:
+        """Treat ``text`` as the current baseline so it is not captured again.
+
+        The Phase 5 popup calls this right after copying an entry back to the
+        clipboard, so the watcher's next poll sees "unchanged" and does not
+        re-store the item it just handed out. Assigning the two attributes is
+        atomic enough for the poll loop: worst case the poll simply treats the
+        value as new and the database dedup rejects it as a duplicate.
+
+        Args:
+            text: The clipboard value now expected on the next poll.
+        """
+        if text is None:
+            return
+        self._last_seen = text
+        self._seeded = True
+
     # -------------------------------------------------------------- retention
 
     def purge_expired(self, *, force: bool = False) -> int:

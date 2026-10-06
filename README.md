@@ -17,11 +17,11 @@ embedding-model download, and no telemetry of any kind.
 | **1** | Clipboard capture, SQLite storage, dedup, CLI | ✅ done |
 | **2** | Local embeddings (`all-MiniLM-L6-v2`), background worker, semantic search via CLI | ✅ done |
 | **3** | Hybrid search (semantic + FTS5 BM25) + time-aware query parsing | ✅ done |
-| **4** | Privacy filters (secret detection, ignore list, retention) + `config.toml` | ✅ **done (this release)** |
-| 5 | PySide6 popup UI, global hotkey, tray icon | planned |
+| **4** | Privacy filters (secret detection, ignore list, retention) + `config.toml` | ✅ done |
+| **5** | PySide6 popup UI, global hotkey, tray icon | ✅ **done (this release)** |
 | 6 | Benchmark script + PyInstaller packaging | planned (test suite exists) |
 
-Current version: **0.4.0** (Phase 4).
+Current version: **0.5.0** (Phase 5).
 
 ---
 
@@ -78,9 +78,9 @@ and full-text indexing, all driven from the command line.
         │                                                    │
 ┌───────▼────────────┐  ┌─────────────────┐  ┌───────────────▼─────────┐
 │  search/           │  │  embeddings/    │  │  ui/                    │
-│  SemanticSearcher  │  │  queue + worker │  │  (Phase 5)              │
-│  KeywordSearcher   │◄─┤  MiniLM (384d)  │  │  PySide6 popup,         │
-│  HybridSearcher    │  │  load once      │  │  hotkey, tray           │
+│  SemanticSearcher  │  │  queue + worker │  │  view_model (no Qt)     │
+│  KeywordSearcher   │◄─┤  MiniLM (384d)  │  │  popup, tray, hotkey    │
+│  HybridSearcher    │  │  load once      │  │  app: one process       │
 │  TimeQuery parser  │  └────────┬────────┘  └─────────────────────────┘
 └────────────────────┘           │
                                  │ writes float32 BLOBs
@@ -191,7 +191,8 @@ network access ClipMind ever performs; everything afterwards runs offline.
 After the weights are cached, loading the model into a fresh process took
 **~11 s** on the Intel Mac this was developed on, so each `search`/`reindex`
 invocation costs that once (the download is additional and one-time). The
-Phase 5 UI keeps one process alive, so it only pays this at startup.
+Phase 5 app (`clipmind app`) keeps one process alive and loads the model once on
+a background thread at startup, so it only pays this once.
 `requirements.txt` pins a version combination that works with PyTorch 2.2.2 (the
 last release with macOS x86_64 wheels) - see the comments there if you are on a
 newer platform.
@@ -539,11 +540,142 @@ keep the keyword index exact.
 
 ---
 
+## Usage (Phase 5: desktop app)
+
+`clipmind app` is **one long-running process** that owns the clipboard watcher
+(with the Phase 4 privacy filters), the embedding service (model loaded **once**
+and kept warm), the tray icon and the global hotkey.
+
+```bash
+clipmind app                 # popup + tray + global hotkey
+clipmind app --no-hotkey     # tray only (e.g. permission not granted yet)
+clipmind app --no-tray
+clipmind app --no-embed      # keyword-only search; torch is never imported
+clipmind app --check         # build everything, print a summary, exit
+```
+
+A second instance refuses to start:
+
+```text
+$ clipmind app
+ClipMind is already running (pid 4711).
+```
+
+That is enforced by an advisory lock file (`app.lock`, next to the database)
+which the OS releases automatically when the process exits, so a crash never
+leaves a stale lock behind.
+
+### Global hotkey
+
+| Platform | Default |
+| -------- | ------- |
+| macOS | `Cmd+Shift+V` |
+| Windows / Linux | `Ctrl+Shift+V` |
+
+Press it to toggle the popup. Set your own in `config.toml`:
+
+```toml
+hotkey = "cmd+shift+v"     # cmd / ctrl / alt / shift + a key
+```
+
+The listener runs on its own thread and only ever **emits a Qt signal**, so no
+widget is ever touched off the Qt main thread.
+
+### macOS permission
+
+macOS gates global key monitoring behind **Input Monitoring**. Without it the
+hotkey registers but receives nothing, so ClipMind checks on first start and
+shows a dialog naming the exact steps:
+
+1. **System Settings → Privacy & Security → Input Monitoring**.
+2. Turn on the switch next to **ClipMind** (or your terminal, when you run
+   ClipMind from a shell) — click **+** and add it if it is not listed.
+3. Quit and reopen ClipMind.
+
+Until the permission is granted the hotkey will not fire, but the tray /
+menu-bar icon still opens the popup. With `pyobjc-framework-Quartz` installed
+(it comes in as a `pynput` dependency on macOS), `clipmind app --check` reports
+the current grant.
+
+### Popup
+
+* Search-on-type with a **150 ms debounce**; searches run on a worker thread so
+  typing never blocks, and superseded searches are dropped by a generation
+  counter (stale results never reach the UI).
+* The same **hybrid + time-aware** search as the CLI, so `react hooks yesterday`
+  works in the box. The detected window shows as a dismissible chip
+  (`⏱ Yesterday ✕`), and ambiguous time shapes are reported rather than filtered.
+* An empty query lists the most recent entries.
+* Every row shows a **type badge**, an ellipsised single-line **preview**
+  (monospace for `code`), the **relative age** (`2h ago`) and — with **Explain**
+  on — the `final/semantic/keyword` scores.
+* Keyboard: `↑`/`↓` move, `⏎` copies back and closes, `Esc` closes, `⌘⌫` (or
+  `Del`) deletes with an **undo toast** (`⌘Z` undoes), and `Tab` cycles
+  **All → Code → Links → Text**. Clicking away closes the popup.
+* Light/dark follows the system; set `theme = "light" | "dark"` to pin it.
+* **Copy-back is suppressed.** Copying an entry back updates the watcher's
+  baseline, so the change is not re-captured, and the database's hash dedup
+  guarantees an existing row is never re-inserted or bumped.
+* If the model is still loading, the popup says **“Loading model…”** and keeps
+  working; a locked database or missing model becomes an in-popup error state
+  instead of a crash. Worker exceptions never take the app down.
+
+### Tray / menu-bar
+
+**Open ClipMind**, **Pause/Resume capture** (reflects the persisted flag live, so
+a `clipmind pause` in a terminal is visible here within ~2 s), **Clear
+history…** (with a confirmation), **Open config file**, **Quit ClipMind**. The
+icon greys out and gains a slash while capture is paused.
+
+On macOS ClipMind runs as a **menu-bar app with no Dock icon**: it calls
+`NSApplication.setActivationPolicy_(Accessory)` at startup (best effort; needs
+`pyobjc`). For a packaged `.app`, the equivalent is in `Info.plist`:
+
+```xml
+<key>LSUIElement</key>
+<true/>
+```
+
+Set `hide_dock_icon = false` in `config.toml` to opt out.
+
+---
+
+## Demo script
+
+A ~30-second recording sequence. Use a throwaway database so nothing mixes with
+your real history:
+
+```bash
+export CLIPMIND_DB=/tmp/clipmind_demo.db
+rm -f "$CLIPMIND_DB"*
+clipmind app                 # the popup stays hidden until summoned
+```
+
+1. **Capture** — copy each of these in any app (browser, editor, terminal):
+   * `https://react.dev/learn` (link)
+   * `SELECT id FROM orders WHERE total > 100;` (code)
+   * `Meeting notes for the Q3 roadmap planning session` (text)
+   * `react hooks article`
+2. **Open** — press **Cmd+Shift+V**. Four entries appear, newest first, search
+   box focused.
+3. **Search** — type `react hooks`. The article jumps to the top. Press **Tab**
+   to filter to **Code**, again for **Links**, then back to **All**.
+4. **Time filter** — type `react hooks yesterday`; a `⏱ Yesterday` chip appears.
+   Click it to dismiss and watch the same query re-run without the filter.
+5. **Explain** — click **Explain** to reveal `final/semantic/keyword` on each row.
+6. **Copy back** — press `↓` and `⏎`. The popup closes and the text is on your
+   clipboard. Reopen it: still one entry, no bumped timestamp.
+7. **Delete + undo** — select a row, press **Cmd+Backspace**, then **Cmd+Z**.
+8. **Pause** — open the tray menu and click **Pause capture**; the icon greys
+   out and newly copied text is not stored. Click **Resume capture** to finish.
+
+---
+
 ## Testing
 
 ```bash
 pip install -r requirements.txt
-python -m pytest              # 369 passed, 6 skipped, ~4s, no model, no network
+python -m pytest              # 454 passed, 6 skipped, ~7s, no model, no network
 python -m pytest --runslow    # + 6 integration tests against the real model
 ```
 
@@ -568,6 +700,38 @@ returns nothing above the threshold. Three cover the hybrid path end to end:
 `"react hooks article yesterday"` returns only yesterday's React link,
 `"ERR_4021"` is found by the keyword retriever, and `"database query"` still
 finds the SQL entry.
+
+Phase 5 adds display-free tests for the popup view-model (debounce coalescing,
+stale-result cancellation, selection/wrap, filter cycling, the time chip,
+copy-back, and delete/undo), copy-back suppression at both the monitor-baseline
+and hash-dedup layers, hotkey parsing, the single-instance lock, and the
+search-backend adapter. A `pytest-qt` smoke test builds the popup and renders
+results under `QT_QPA_PLATFORM=offscreen` (it is skipped cleanly when PySide6 or
+pytest-qt are missing), and a `clipmind app --check` test exercises the full
+wiring headlessly. The base suite never imports PySide6 from the non-Qt modules.
+
+### Manual test checklist (needs a real GUI/hotkey session)
+
+The sandbox this was developed in has **no display and no Input Monitoring
+grant**, so the following are written but **unverified** and must be checked by
+hand:
+
+- [ ] `clipmind app` shows a menu-bar icon and **no** Dock icon.
+- [ ] `Cmd+Shift+V` toggles the popup from another app (incl. full-screen); the
+      search box has focus immediately.
+- [ ] Typing filters the list within ~150 ms without freezing the UI.
+- [ ] `↑`/`↓`/`⏎`/`Esc`/`Tab`/`⌘⌫`/`⌘Z` behave as described above.
+- [ ] Clicking another app closes the popup.
+- [ ] `⏎` copies back; the reopened popup shows the same single entry (no new
+      row, no bumped timestamp).
+- [ ] Tray **Pause/Resume** toggles the icon and stops/starts capture, and a
+      `clipmind pause` in a terminal updates the menu within ~2 s.
+- [ ] Tray **Clear history…** confirms, then empties the list.
+- [ ] Tray **Open config file** opens `config.toml` (creating it if missing).
+- [ ] On a fresh machine the first run shows the Input Monitoring dialog with
+      the right steps; granting it and reopening makes the hotkey work.
+- [ ] Switching macOS appearance (and `theme = "dark"`) re-themes the popup.
+- [ ] A second `clipmind app` prints "already running" and exits 2.
 
 ---
 
@@ -596,11 +760,12 @@ finds the SQL entry.
 
 ---
 
-## Limitations (through Phase 4)
+## Limitations (through Phase 5)
 
 * **Text only.** No images, files or rich content.
-* **Foreground process.** `watch` must be running; it is not yet a service. The
-  tray icon and global hotkey arrive in Phase 5.
+* **One process at a time.** `clipmind app` is the long-running process and
+  refuses to start twice; `clipmind watch` is still a separate foreground
+  command. Run one against a database, not both.
 * **`source_app` is usually empty on macOS** unless you install `pyobjc`
   (`pip install pyobjc-framework-Cocoa`). The column is always populated when
   the frontmost app can be determined, and can be forced with
@@ -641,6 +806,21 @@ finds the SQL entry.
 * **The source-app ignore list needs app detection.** On macOS without
   `pyobjc`, and on Linux/Windows generally, the frontmost app is usually
   unknown, so the ignore list cannot fire - the secret detectors still run.
+* **The UI was verified headlessly, not visually.** The suite runs the popup
+  under `QT_QPA_PLATFORM=offscreen`. Real rendering, the menu-bar app, the
+  permission dialog and the global hotkey itself were **not** exercised in the
+  development sandbox (no display). Use the manual checklist in the Testing
+  section.
+* **Windows/Linux UI is untested.** The hotkey default, the `pynput` backend and
+  the tray are written portably, but only macOS was exercised. Menu-bar/Dock
+  behaviour is macOS-only.
+* **The tray icon needs a system tray.** Where none is available (headless,
+  some Linux desktops) ClipMind logs a warning and the hotkey is the only way to
+  summon the popup.
+* **On macOS the hotkey needs Input Monitoring.** Without it the listener starts
+  but receives no events; the tray menu is the fallback.
+* **Undo re-inserts a deleted row with its original timestamp and embedding**,
+  but it gets a new id.
 * **`clear`/`purge` rewrite the database with `VACUUM`.** That is a hard delete
   as far as SQLite is concerned, but it is not a secure erase of free space on
   disk; use full-disk encryption if that matters to you.
@@ -676,8 +856,17 @@ clipmind/
 │   ├── privacy/
 │   │   ├── detectors.py     # regex detectors + Luhn/JWT validation
 │   │   └── policy.py        # skip/mask policy, masking, ignore list
-│   └── ui/                  # Phase 5 (placeholder)
-├── tests/                   # pytest suite
+│   └── ui/                  # Phase 5 desktop UI
+│       ├── view_model.py    # display-free controller (no Qt import)
+│       ├── search_backend.py# hybrid + time-aware search adapter
+│       ├── hotkey.py        # pynput listener + macOS permission helpers (no Qt)
+│       ├── single_instance.py# app.lock (flock / msvcrt)
+│       ├── clipboard.py     # copy-back that suppresses re-capture
+│       ├── theme.py         # light/dark palettes -> Qt style sheet
+│       ├── popup.py         # frameless Spotlight-style window + row delegate
+│       ├── tray.py          # menu-bar icon + menu
+│       └── app.py           # `clipmind app`: wires everything together
+├── tests/                   # pytest suite (incl. offscreen pytest-qt smoke test)
 ├── requirements.txt
 └── pyproject.toml           # packaging + `clipmind` entry point
 ```
@@ -692,7 +881,7 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # --- Phase 1: capture + storage (fast, no model) ---
-python -m pytest                       # 369 passed, 6 skipped
+python -m pytest                       # 454 passed, 6 skipped
 export CLIPMIND_DB=/tmp/clipmind_demo.db
 python -m clipmind add "SELECT id FROM orders;"
 python -m clipmind add "https://react.dev/learn"
@@ -731,6 +920,12 @@ python -m clipmind purge --older-than 30d
 python -m clipmind config path                      # ~/.config/clipmind/config.toml
 python -m clipmind config show
 python -m clipmind config show --template           # documented defaults
+
+# --- Phase 5: desktop app ---
+python -m clipmind app --check        # headless wiring summary, exit 0
+python -m clipmind app                # popup + tray + global hotkey
+#   Cmd+Shift+V opens the popup; type "react hooks yesterday", press Enter
+python -m pytest                      # 454 passed, 6 skipped
 
 # --- live capture with automatic embedding ---
 python -m clipmind watch     # in one tab; copy things in another app

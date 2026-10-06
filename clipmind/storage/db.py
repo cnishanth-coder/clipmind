@@ -50,6 +50,42 @@ def hash_content(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def preview_text(content: str, max_len: int = 80) -> str:
+    """Collapse ``content`` to one line and truncate it to ``max_len`` chars.
+
+    A single ellipsis character (``…``) marks truncation, so the result is at
+    most ``max_len`` characters long.
+    """
+    collapsed = " ".join(content.split())
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max_len - 1] + "\u2026"
+
+
+def relative_age(created_at: datetime, now: Optional[datetime] = None) -> str:
+    """Return a short human-readable age such as ``"5m ago"`` or ``"2d ago"``.
+
+    Ages of one week or more fall back to an absolute local date.
+    """
+    now = now or utcnow()
+    delta = now - created_at
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return "just now"
+    if seconds < 60:
+        return "just now" if seconds < 5 else f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    days = hours // 24
+    if days < 7:
+        return f"{days}d ago"
+    return created_at.astimezone().strftime("%Y-%m-%d")
+
+
 @dataclass(frozen=True, slots=True)
 class ClipRecord:
     """A single stored clipboard entry.
@@ -92,30 +128,11 @@ class ClipRecord:
 
     def preview(self, max_len: int = 80) -> str:
         """Return a single-line preview of the content, at most ``max_len`` chars."""
-        collapsed = " ".join(self.content.split())
-        if len(collapsed) <= max_len:
-            return collapsed
-        return collapsed[: max_len - 1] + "\u2026"
+        return preview_text(self.content, max_len)
 
     def relative_time(self, now: Optional[datetime] = None) -> str:
         """Return a short human-readable age such as ``"5m ago"`` or ``"2d ago"``."""
-        now = now or utcnow()
-        delta = now - self.created_at
-        seconds = int(delta.total_seconds())
-        if seconds < 0:
-            return "just now"
-        if seconds < 60:
-            return "just now" if seconds < 5 else f"{seconds}s ago"
-        minutes = seconds // 60
-        if minutes < 60:
-            return f"{minutes}m ago"
-        hours = minutes // 60
-        if hours < 24:
-            return f"{hours}h ago"
-        days = hours // 24
-        if days < 7:
-            return f"{days}d ago"
-        return self.created_at.astimezone().strftime("%Y-%m-%d")
+        return relative_age(self.created_at, now)
 
     def local_time(self) -> datetime:
         """Return :attr:`created_at` converted to the local timezone."""

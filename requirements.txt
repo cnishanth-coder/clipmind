@@ -27,9 +27,16 @@ sentence-transformers==3.4.1
 # Secret detection is regex + validation, and config.toml is read with the
 # Python 3.11+ standard-library `tomllib`.
 
-# Phase 5 (desktop UI):
-# pynput>=1.7
-# PySide6>=6.7
+# Phase 5 (desktop UI): popup, tray icon and global hotkey.
+#
+# PySide6 is pinned to the 6.7 line: it is the newest release verified to
+# install on macOS x86_64 (Intel) with Python 3.12 and torch 2.2.2. `pynput`
+# pulls in pyobjc-framework-Cocoa/Quartz on macOS, which also powers the
+# frontmost-app detection and the Input Monitoring permission check.
+PySide6>=6.7,<6.8
+pynput>=1.7,<2
 
 # Development / tests:
 pytest>=8.0
+# pytest-qt drives the offscreen popup smoke test; without it that test skips.
+pytest-qt>=4.4,<5

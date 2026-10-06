@@ -39,6 +39,11 @@ Environment overrides
 ``CLIPMIND_RETENTION_DAYS``  Auto-delete entries older than this many days (0 = off).
 ``CLIPMIND_PRIVACY``         ``0`` to disable secret detection, ``1`` to enable.
 ``CLIPMIND_IGNORE_APPS``     Comma-separated source-app ignore list.
+``CLIPMIND_HOTKEY``          Global hotkey (e.g. ``cmd+shift+v``).
+``CLIPMIND_THEME``           ``system``, ``light`` or ``dark``.
+``CLIPMIND_UI_LIST_LIMIT``   Rows shown in the popup.
+``CLIPMIND_UI_DEBOUNCE_MS``  Typing idle time before the popup searches.
+``CLIPMIND_UI_EXPLAIN``      ``1`` to show the score breakdown in the popup.
 """
 
 from __future__ import annotations
@@ -106,6 +111,27 @@ DEFAULT_NIGHT = (21, 5)
 
 #: Week start for "this week"/"last week"; Monday by Python's convention.
 DEFAULT_WEEK_START = 0
+
+#: Default global hotkey. macOS uses Cmd, everything else Ctrl.
+DEFAULT_HOTKEY = "cmd+shift+v" if sys.platform == "darwin" else "ctrl+shift+v"
+
+#: Theme values accepted by ``Config.theme``.
+THEMES = frozenset({"system", "light", "dark"})
+
+#: Default UI theme: follow the operating system's light/dark setting.
+DEFAULT_THEME = "system"
+
+#: Rows the popup shows for an empty query and as the search result cap.
+DEFAULT_UI_LIST_LIMIT = 20
+
+#: Milliseconds of typing idle time before the popup runs a search.
+DEFAULT_UI_DEBOUNCE_MS = 150
+
+#: Whether the popup starts with the semantic/keyword score shown per row.
+DEFAULT_UI_EXPLAIN = False
+
+#: On macOS, hide the Dock icon so ClipMind behaves as a menu-bar app.
+DEFAULT_HIDE_DOCK_ICON = True
 
 #: Whether secret detection/masking is on by default.
 DEFAULT_PRIVACY_ENABLED = True
@@ -316,6 +342,21 @@ def _db_path(key: str, raw: object) -> Path:
     return Path(_string(key, raw)).expanduser()
 
 
+def _theme(key: str, raw: object) -> str:
+    value = _string(key, raw)
+    if value not in THEMES:
+        options = ", ".join(sorted(THEMES))
+        raise ConfigError(f"{key!r} must be one of {options} (got {value!r})")
+    return value
+
+
+def _hotkey(key: str, raw: object) -> str:
+    value = _string(key, raw).strip().lower()
+    if not value:
+        raise ConfigError(f"{key!r} must not be empty (e.g. \"cmd+shift+v\")")
+    return value
+
+
 #: Maps a ``config.toml`` key to a converter that validates and normalises it.
 _FIELD_VALIDATORS: dict[str, Callable[[str, object], object]] = {
     "db_path": _db_path,
@@ -343,6 +384,12 @@ _FIELD_VALIDATORS: dict[str, Callable[[str, object], object]] = {
     "secret_actions": _secret_actions,
     "ignore_source_apps": _string_list,
     "retention_days": _retention_days,
+    "hotkey": _hotkey,
+    "theme": _theme,
+    "ui_list_limit": lambda k, v: _positive_int(k, v),
+    "ui_debounce_ms": lambda k, v: _positive_int(k, v, minimum=0),
+    "ui_explain": _bool,
+    "hide_dock_icon": _bool,
 }
 
 
@@ -412,8 +459,21 @@ def default_config_toml() -> str:
         'ignore_source_apps = ["1Password", "Bitwarden", "KeePassXC", '
         '"Keychain Access", "LastPass"]\n'
         "\n"
+        "# --- ui (Phase 5) ---\n"
+        "# Global hotkey that toggles the popup. macOS: cmd+shift+v;"
+        " elsewhere ctrl+shift+v.\n"
+        f'hotkey = "{DEFAULT_HOTKEY}"\n'
+        "# system | light | dark\n"
+        f'theme = "{DEFAULT_THEME}"\n'
+        f"ui_list_limit = {DEFAULT_UI_LIST_LIMIT}\n"
+        f"ui_debounce_ms = {DEFAULT_UI_DEBOUNCE_MS}\n"
+        f"ui_explain = {'true' if DEFAULT_UI_EXPLAIN else 'false'}\n"
+        "# macOS only: hide the Dock icon so ClipMind is a menu-bar app.\n"
+        f"hide_dock_icon = {'true' if DEFAULT_HIDE_DOCK_ICON else 'false'}\n"
+        "\n"
         "# Per-category policy for detected secrets: \"skip\" (never store the\n"
         "# entry) or \"mask\" (store with the secret replaced by [REDACTED:kind]).\n"
+        "# Note: this is a TOML table, so it must come after every top-level key.\n"
         "[secret_actions]\n"
         'private_key = "skip"\n'
         'credit_card = "skip"\n'
@@ -489,6 +549,13 @@ class Config:
             (case-insensitive substring match).
         retention_days: Auto-delete entries older than this many days. ``None``
             disables automatic purging.
+        hotkey: Global hotkey that toggles the popup (``"cmd+shift+v"``).
+        theme: ``"system"``, ``"light"`` or ``"dark"``.
+        ui_list_limit: Rows the popup shows.
+        ui_debounce_ms: Typing idle time, in milliseconds, before the popup
+            runs a search.
+        ui_explain: When True the popup shows the semantic/keyword score per row.
+        hide_dock_icon: On macOS, hide the Dock icon (menu-bar app behaviour).
     """
 
     db_path: Path = None  # type: ignore[assignment]
@@ -518,6 +585,12 @@ class Config:
     )
     ignore_source_apps: tuple[str, ...] = DEFAULT_IGNORE_SOURCE_APPS
     retention_days: Optional[int] = None
+    hotkey: str = DEFAULT_HOTKEY
+    theme: str = DEFAULT_THEME
+    ui_list_limit: int = DEFAULT_UI_LIST_LIMIT
+    ui_debounce_ms: int = DEFAULT_UI_DEBOUNCE_MS
+    ui_explain: bool = DEFAULT_UI_EXPLAIN
+    hide_dock_icon: bool = DEFAULT_HIDE_DOCK_ICON
 
     def __post_init__(self) -> None:
         if self.db_path is None:
@@ -526,6 +599,11 @@ class Config:
             raise ValueError(
                 f"oversize_policy must be 'truncate' or 'skip', got {self.oversize_policy!r}"
             )
+        if self.theme not in THEMES:
+            options = ", ".join(sorted(THEMES))
+            raise ValueError(f"theme must be one of {options}, got {self.theme!r}")
+        if not str(self.hotkey).strip():
+            raise ValueError("hotkey must not be empty")
         bad = {name: action for name, action in self.secret_actions.items()
                if action not in SECRET_ACTIONS}
         if bad:
@@ -562,6 +640,11 @@ class Config:
             "CLIPMIND_RETENTION_DAYS": ("retention_days", _parse_retention_env),
             "CLIPMIND_PRIVACY": ("privacy_enabled", _parse_bool_env),
             "CLIPMIND_IGNORE_APPS": ("ignore_source_apps", _parse_app_list_env),
+            "CLIPMIND_HOTKEY": ("hotkey", str),
+            "CLIPMIND_THEME": ("theme", str),
+            "CLIPMIND_UI_LIST_LIMIT": ("ui_list_limit", int),
+            "CLIPMIND_UI_DEBOUNCE_MS": ("ui_debounce_ms", int),
+            "CLIPMIND_UI_EXPLAIN": ("ui_explain", _parse_bool_env),
         }
         changes: dict[str, object] = {}
         for env_var, (field_name, cast) in env_map.items():
