@@ -20,11 +20,12 @@ summary and exits, which is how the smoke test verifies the wiring headlessly.
 from __future__ import annotations
 
 import logging
+import signal
 import sys
 import threading
-from typing import Optional
+from typing import Any, Callable, Optional
 
-from PySide6.QtCore import QObject, QUrl, Qt, Signal
+from PySide6.QtCore import QObject, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
 
@@ -55,6 +56,111 @@ logger = logging.getLogger(__name__)
 
 #: ``meta`` key recording that the permission dialog has been shown once.
 _PERMISSION_PROMPTED_KEY = "ui_permission_prompted"
+
+#: Signals that ask a running ``clipmind app`` to shut down cleanly.
+SHUTDOWN_SIGNALS: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM)
+
+#: How often the main thread checks for a recorded shutdown request (ms).
+SIGNAL_POLL_MS = 200
+
+
+class SignalShutdown(QObject):
+    """Turn Ctrl+C (and ``SIGTERM``) into an orderly shutdown of the Qt app.
+
+    CPython only runs a signal handler between bytecode instructions, and
+    ``QApplication.exec()`` spends its time inside Qt's C++ event loop, so a
+    ``SIGINT`` is not noticed until some Python callback hands control back to
+    the interpreter. Leaving the default handler installed means the signal is
+    delivered *inside* whichever callback happens to be running - typically the
+    tray's ``_refresh_state`` timer - which is why Ctrl+C used to print a
+    ``KeyboardInterrupt`` traceback instead of quitting.
+
+    This object replaces the default handler with one that only records the
+    request (never touching widgets from the signal context) and runs a no-op
+    :class:`QTimer` that keeps the interpreter ticking so the handler fires
+    promptly. The recorded request is then turned into a single call to
+    ``on_shutdown`` on the main thread, outside the signal context.
+
+    Args:
+        on_shutdown: Called once, on the Qt thread, after a shutdown signal.
+        interval_ms: How often to check for a recorded request.
+        parent: Optional parent object.
+    """
+
+    def __init__(
+        self,
+        on_shutdown: Callable[[], None],
+        *,
+        interval_ms: int = SIGNAL_POLL_MS,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        """Store the callback and build the poll timer (installed separately)."""
+        super().__init__(parent)
+        self._on_shutdown = on_shutdown
+        self._requested: Optional[str] = None
+        self._installed = False
+        self._previous: dict[int, Any] = {}
+        self._timer = QTimer(self)
+        self._timer.setInterval(interval_ms)
+        self._timer.timeout.connect(self._poll)
+
+    @property
+    def requested(self) -> Optional[str]:
+        """Name of the signal that asked for shutdown, or ``None``."""
+        return self._requested
+
+    def install(self) -> "SignalShutdown":
+        """Install the handlers and start polling (main thread only).
+
+        Returns:
+            ``self``, so the call can be chained. Installing twice is a no-op.
+        """
+        if self._installed:
+            return self
+        for signum in SHUTDOWN_SIGNALS:
+            try:
+                self._previous[signum] = signal.getsignal(signum)
+                signal.signal(signum, self._handle)
+            except (ValueError, OSError, RuntimeError):
+                # e.g. called off the main thread, or no SIGTERM on the host.
+                self._previous.pop(signum, None)
+        self._timer.start()
+        self._installed = True
+        return self
+
+    def uninstall(self) -> None:
+        """Stop polling and restore whatever handlers were installed before."""
+        self._timer.stop()
+        for signum, previous in self._previous.items():
+            try:
+                signal.signal(signum, previous)
+            except (ValueError, OSError, RuntimeError):  # pragma: no cover
+                pass
+        self._previous.clear()
+        self._installed = False
+
+    def _handle(self, signum: int, _frame: Any) -> None:
+        """Record the request only; Qt work happens later on the main thread."""
+        try:
+            self._requested = signal.Signals(signum).name
+        except ValueError:  # pragma: no cover - unknown signal number
+            self._requested = str(signum)
+
+    def _poll(self) -> None:
+        """Run the shutdown callback once a request has been recorded."""
+        if self._requested is None:
+            return
+        name = self._requested
+        self._requested = None
+        self._timer.stop()
+        logger.info("received %s; shutting down", name)
+        try:
+            self._on_shutdown()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("shutdown callback failed")
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
 
 class HotkeyBridge(QObject):
@@ -412,13 +518,27 @@ def run_app(
         lock.release()
         return 0
 
-    # Normal run: keep the lock, start the background pieces, enter the loop.
-    instance.start()
+    # Normal run: keep the lock, wire up Ctrl+C/SIGTERM, start the background
+    # pieces and enter the event loop. The signal handlers are installed before
+    # any worker starts, so a signal can never be delivered before there is
+    # something to shut down.
+    signals = SignalShutdown(instance.quit)
+    signals.install()
     try:
+        instance.start()
         return int(app.exec())
     finally:
+        signals.uninstall()
         instance.db.close()
         lock.release()
 
 
-__all__ = ["AlreadyRunning", "ClipMindApplication", "HotkeyBridge", "run_app"]
+__all__ = [
+    "AlreadyRunning",
+    "ClipMindApplication",
+    "HotkeyBridge",
+    "SIGNAL_POLL_MS",
+    "SHUTDOWN_SIGNALS",
+    "SignalShutdown",
+    "run_app",
+]

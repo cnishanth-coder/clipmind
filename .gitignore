@@ -1,14 +1,31 @@
-.venv/
+# --- Python ---------------------------------------------------------------
 __pycache__/
 *.py[cod]
-.pytest_cache/
 *.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 build/
 dist/
-*.spec
 
-# Local ClipMind data (never commit captured clipboard content)
+# --- Packaging ------------------------------------------------------------
+# NOTE: clipmind.spec is the checked-in PyInstaller spec - do not ignore *.spec.
+packaging/ClipMind.iconset/
+*.dmg
+*.zip
+
+# --- Local ClipMind data (never commit captured clipboard content) --------
 *.db
 *.db-wal
 *.db-shm
 data/
+benchmarks/results.json
+
+# --- OS / editor ----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+*.swp

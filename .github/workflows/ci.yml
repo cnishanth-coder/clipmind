@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast, offline test suite on macOS and Windows. The suite never loads the
+  # real embedding model (a fake embedder stands in), so torch/transformers are
+  # deliberately NOT installed here - that keeps CI to a couple of minutes.
+  tests:
+    name: tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install \
+            "numpy>=1.26,<2" \
+            "pyperclip>=1.8,<2" \
+            "pytest>=8.0" \
+            "pytest-qt>=4.4,<5" \
+            "PySide6>=6.7,<6.8" \
+            "pynput>=1.7,<2"
+          python -m pip install -e . --no-deps
+
+      - name: Run the fast test suite
+        run: python -m pytest -q
+
+  # Build the macOS .app when a version tag is pushed (or on manual dispatch).
+  # The artifact is built for the runner's architecture; on GitHub's Apple
+  # Silicon runners that is arm64. Build Intel/other-arch bundles locally with
+  # scripts/build_macos.sh.
+  build-macos:
+    name: build macOS app
+    needs: tests
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -e . --no-deps
+          python -m pip install "pyinstaller>=6.0"
+
+      - name: Build ClipMind.app
+        run: bash scripts/build_macos.sh --no-install --zip --dmg
+
+      - name: Show bundle info
+        run: |
+          du -sh dist/ClipMind.app dist/ClipMind.zip || true
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" dist/ClipMind.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :LSUIElement" dist/ClipMind.app/Contents/Info.plist
+
+      - name: Upload the app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClipMind-macos-${{ github.ref_name }}
+          path: |
+            dist/ClipMind.zip
+            dist/ClipMind.dmg
+          if-no-files-found: warn
+          retention-days: 14

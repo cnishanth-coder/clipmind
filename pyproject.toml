@@ -4,11 +4,37 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clipmind"
-version = "0.5.0"
-description = "Local-first desktop clipboard manager with semantic search and time-aware queries."
+version = "0.6.0"
+description = "Local-first desktop clipboard manager with semantic search, time-aware queries and privacy filters."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+authors = [{ name = "ClipMind contributors" }]
+keywords = [
+    "clipboard",
+    "clipboard-manager",
+    "semantic-search",
+    "local-first",
+    "privacy",
+    "sqlite",
+    "fts5",
+    "sentence-transformers",
+    "pyside6",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: MacOS X :: Cocoa",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Desktop Environment",
+    "Topic :: Utilities",
+]
 dependencies = [
     "pyperclip>=1.8,<2",
     # Pinned for torch 2.2.2 (last macOS x86_64 wheel); see requirements.txt.
@@ -19,12 +45,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-qt>=4.4,<5"]
-# Phases 3-4 add no runtime dependency (stdlib time parser + SQLite FTS5 +
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.4,<5",
+    # Needed by benchmarks/bench_search.py and the bundled-model icon script.
+    "pillow>=10.0",
+]
+build = [
+    "pyinstaller>=6.0",
+]
+# Phase 3-4 add no runtime dependency (stdlib time parser + SQLite FTS5 +
 # stdlib tomllib for config.toml).
 # Phase 5: the desktop UI. PySide6 is pinned to the 6.7 line (macOS x86_64 +
 # Python 3.12); pynput also pulls in pyobjc-framework-Quartz on macOS.
 ui = ["PySide6>=6.7,<6.8", "pynput>=1.7,<2"]
+
+[project.urls]
+Homepage = "https://github.com/cnishanth-coder/clipmind"
+Repository = "https://github.com/cnishanth-coder/clipmind"
+Issues = "https://github.com/cnishanth-coder/clipmind/issues"
 
 [project.scripts]
 clipmind = "clipmind.capture.cli:main"

@@ -40,3 +40,11 @@ pynput>=1.7,<2
 pytest>=8.0
 # pytest-qt drives the offscreen popup smoke test; without it that test skips.
 pytest-qt>=4.4,<5
+
+# Phase 6 (benchmark + packaging): no new *runtime* dependencies.
+#   * benchmarks/bench_search.py uses the embedding stack above plus numpy.
+#   * scripts/make_icon.py needs Pillow (already pulled in by torchvision/torch).
+#   * the macOS bundle needs PyInstaller; it is declared as the `build` extra
+#     (`pip install -e ".[build]"`) and installed for you by
+#     scripts/build_macos.sh.
+pillow>=10.0
