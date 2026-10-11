@@ -1,0 +1,379 @@
+{
+  "environment": {
+    "platform": "macOS-26.6.2-x86_64-i386-64bit",
+    "machine": "x86_64",
+    "processor": "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz",
+    "python": "3.12.15",
+    "numpy": "1.26.4",
+    "torch": "2.2.2",
+    "torch_threads": "8",
+    "sentence_transformers": "3.4.1",
+    "device": "mps:0",
+    "model": "all-MiniLM-L6-v2"
+  },
+  "corpus_size": 10000,
+  "corpus_types": {
+    "text": 3651,
+    "url": 2227,
+    "email": 1883,
+    "code": 1782,
+    "number": 457
+  },
+  "query_count": 200,
+  "throughput": {
+    "texts": 10000.0,
+    "seconds": 26.90313099400373,
+    "texts_per_second": 371.7039478501159,
+    "chars_per_second": 18866.39142905441,
+    "chunk": 256.0,
+    "model_load_seconds": 8.954330162996484
+  },
+  "latency_ms": {
+    "semantic": {
+      "count": 200.0,
+      "mean": 265.5455058698499,
+      "min": 208.5957489980501,
+      "p50": 227.6851495007577,
+      "p95": 418.54257180020795,
+      "p99": 612.9928038827329,
+      "max": 900.9705829957966
+    },
+    "keyword": {
+      "count": 200.0,
+      "mean": 5.637514650079538,
+      "min": 0.550482000107877,
+      "p50": 5.017200001020683,
+      "p95": 12.563365645837619,
+      "p99": 16.489837309563825,
+      "max": 30.914777002180927
+    },
+    "hybrid": {
+      "count": 200.0,
+      "mean": 259.10110189004627,
+      "min": 199.81373799964786,
+      "p50": 234.2923560026975,
+      "p95": 368.66864239673293,
+      "p99": 437.86931222464716,
+      "max": 651.3105909980368
+    }
+  },
+  "quality": {
+    "semantic": {
+      "top1": 0.43333333333333335,
+      "top5": 0.7,
+      "total": 30.0
+    },
+    "keyword": {
+      "top1": 0.43333333333333335,
+      "top5": 0.5333333333333333,
+      "total": 30.0
+    },
+    "hybrid": {
+      "top1": 0.4666666666666667,
+      "top5": 0.7333333333333333,
+      "total": 30.0
+    }
+  },
+  "per_query_ranks": [
+    {
+      "query": "python query the orders table by customer id",
+      "expected": "SELECT order_id, total FROM orders WHERE customer_id = 4021;",
+      "note": "code",
+      "ranks": {
+        "semantic": null,
+        "keyword": null,
+        "hybrid": null
+      }
+    },
+    {
+      "query": "sql average order value per month",
+      "expected": "SELECT strftime('%Y-%m', created_at) AS month, AVG(total) FROM orders GROUP BY month;",
+      "note": "code",
+      "ranks": {
+        "semantic": 1,
+        "keyword": null,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "git command to squash the last three commits",
+      "expected": "git rebase -i HEAD~3",
+      "note": "code",
+      "ranks": {
+        "semantic": 3,
+        "keyword": null,
+        "hybrid": 3
+      }
+    },
+    {
+      "query": "javascript fetch with async await",
+      "expected": "async function loadUser(id) {\n  const res = await fetch(`/api/users/${id}`);\n  return res.json();\n}",
+      "note": "code",
+      "ranks": {
+        "semantic": null,
+        "keyword": null,
+        "hybrid": null
+      }
+    },
+    {
+      "query": "reverse a linked list in python",
+      "expected": "def reverse_list(head):\n    prev = None\n    while head:\n        head.next, prev, head = prev, head, head.next\n    return prev",
+      "note": "code",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "docker build and tag an image",
+      "expected": "docker build -t clipmind:latest .",
+      "note": "code",
+      "ranks": {
+        "semantic": null,
+        "keyword": 1,
+        "hybrid": null
+      }
+    },
+    {
+      "query": "regex to validate an email address",
+      "expected": "^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$",
+      "note": "code",
+      "ranks": {
+        "semantic": null,
+        "keyword": null,
+        "hybrid": null
+      }
+    },
+    {
+      "query": "bash loop over log files and gzip them",
+      "expected": "for f in *.log; do gzip \"$f\"; done",
+      "note": "code",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "react hook that fetches data on mount",
+      "expected": "useEffect(() => {\n  fetchData().then(setData);\n}, []);",
+      "note": "code",
+      "ranks": {
+        "semantic": null,
+        "keyword": null,
+        "hybrid": null
+      }
+    },
+    {
+      "query": "kubectl list pods across namespaces",
+      "expected": "kubectl get pods -n production -o wide",
+      "note": "code",
+      "ranks": {
+        "semantic": 2,
+        "keyword": 2,
+        "hybrid": 2
+      }
+    },
+    {
+      "query": "react refs documentation page",
+      "expected": "https://react.dev/learn/referencing-values-with-refs",
+      "note": "url",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "rust book chapter about ownership",
+      "expected": "https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html",
+      "note": "url",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "postgres window functions tutorial",
+      "expected": "https://www.postgresql.org/docs/current/tutorial-window.html",
+      "note": "url",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "mdn array map reference",
+      "expected": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Array/map",
+      "note": "url",
+      "ranks": {
+        "semantic": null,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "python pathlib documentation",
+      "expected": "https://docs.python.org/3/library/pathlib.html",
+      "note": "url",
+      "ranks": {
+        "semantic": 2,
+        "keyword": 4,
+        "hybrid": 3
+      }
+    },
+    {
+      "query": "sqlite full text search fts5 docs",
+      "expected": "https://www.sqlite.org/fts5.html",
+      "note": "url",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 2,
+        "hybrid": 2
+      }
+    },
+    {
+      "query": "django migrations guide",
+      "expected": "https://docs.djangoproject.com/en/stable/topics/migrations/",
+      "note": "url",
+      "ranks": {
+        "semantic": 2,
+        "keyword": null,
+        "hybrid": 2
+      }
+    },
+    {
+      "query": "email the design team about the landing page review",
+      "expected": "landing-page-review@acme-corp.com",
+      "note": "email",
+      "ranks": {
+        "semantic": null,
+        "keyword": null,
+        "hybrid": null
+      }
+    },
+    {
+      "query": "invoice from the cloud hosting provider",
+      "expected": "billing@cloudhost.io",
+      "note": "email",
+      "ranks": {
+        "semantic": 3,
+        "keyword": null,
+        "hybrid": 3
+      }
+    },
+    {
+      "query": "support address for the payments vendor",
+      "expected": "support@stripe-payments.example",
+      "note": "email",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "HR contact for onboarding at acme",
+      "expected": "onboarding@acme-corp.com",
+      "note": "email",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "sprint planning moved to Thursday afternoon",
+      "expected": "Standup moves to 9:30; sprint planning is now Thursday at 3pm in room B.",
+      "note": "text",
+      "ranks": {
+        "semantic": null,
+        "keyword": null,
+        "hybrid": null
+      }
+    },
+    {
+      "query": "when does the wildcard ssl certificate expire",
+      "expected": "The wildcard SSL certificate for *.example.com expires on 2026-11-30.",
+      "note": "text",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "grocery list with oat milk and sourdough",
+      "expected": "Shopping: oat milk, sourdough bread, eggs, spinach, coffee beans.",
+      "note": "text",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "idea for a cli that summarises git history",
+      "expected": "Idea: a CLI that summarises the last week of git history into a changelog.",
+      "note": "text",
+      "ranks": {
+        "semantic": 1,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "how do I reset the wifi router",
+      "expected": "To reset the router, hold the pinhole button for ten seconds until the lights blink.",
+      "note": "text",
+      "ranks": {
+        "semantic": 1,
+        "keyword": null,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "client quote about the dashboard speed",
+      "expected": "\"The dashboard feels much faster now - great work on the caching layer.\"",
+      "note": "text",
+      "ranks": {
+        "semantic": 2,
+        "keyword": null,
+        "hybrid": 3
+      }
+    },
+    {
+      "query": "conference talk about local-first software",
+      "expected": "Talk idea: local-first software, and why your app should work offline.",
+      "note": "text",
+      "ranks": {
+        "semantic": 5,
+        "keyword": 1,
+        "hybrid": 1
+      }
+    },
+    {
+      "query": "twenty minute tomato pasta recipe",
+      "expected": "Recipe: boil 200g spaghetti, saute garlic and tomatoes, toss with basil.",
+      "note": "text",
+      "ranks": {
+        "semantic": 4,
+        "keyword": null,
+        "hybrid": 4
+      }
+    },
+    {
+      "query": "flight booking confirmation for Lisbon",
+      "expected": "Flight TP1042 LIS, 2026-12-18 07:40, seat 14C, confirmation XR7Q2P.",
+      "note": "text",
+      "ranks": {
+        "semantic": null,
+        "keyword": null,
+        "hybrid": null
+      }
+    }
+  ]
+}

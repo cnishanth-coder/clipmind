@@ -13,21 +13,28 @@ per-user data directory by default (see :mod:`clipmind.config`).
 from __future__ import annotations
 
 import hashlib
+import logging
 import sqlite3
 import threading
+import weakref
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Protocol, Sequence, runtime_checkable
 
 from ..config import Config
+
+logger = logging.getLogger(__name__)
 
 #: Bump when the on-disk schema changes in an incompatible way.
 SCHEMA_VERSION = 1
 
 #: ``meta`` key holding the persisted pause flag (``"1"`` when paused).
 PAUSED_META_KEY = "paused"
+
+#: ``meta`` key holding the embedding model that produced the stored vectors.
+EMBEDDING_MODEL_META_KEY = "embedding_model"
 
 #: Columns of the ``items`` table, in display order.
 _ITEM_COLUMNS = (
@@ -43,6 +50,22 @@ def utcnow() -> datetime:
 def utcnow_iso() -> str:
     """Return the current UTC time as an ISO-8601 string (millisecond precision)."""
     return utcnow().isoformat(timespec="milliseconds")
+
+
+def coerce_timestamp(value: Optional[datetime | str]) -> str:
+    """Normalise ``value`` to a UTC ISO-8601 string (millisecond precision).
+
+    This is the single place timestamps are turned into the text stored in
+    ``items.created_at``; filtering the in-memory embedding index compares the
+    same strings, so it must stay in lockstep with the SQL comparisons.
+    """
+    if value is None:
+        return utcnow_iso()
+    if isinstance(value, str):
+        return value
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def hash_content(content: str) -> str:
@@ -137,6 +160,41 @@ class ClipRecord:
     def local_time(self) -> datetime:
         """Return :attr:`created_at` converted to the local timezone."""
         return self.created_at.astimezone()
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseChange:
+    """One item-level change broadcast to registered listeners.
+
+    Attributes:
+        generation: Monotonic counter, incremented once per committed change.
+            Listeners use it to detect a change they missed (and fall back to
+            a full reload instead of trusting a stale incremental state).
+        kind: ``"insert"``, ``"embedding"``, ``"delete"``, ``"delete_many"``
+            or ``"clear"``.
+        item_id: Affected row id for ``insert``/``embedding``/``delete``.
+        item_ids: Affected row ids for ``delete_many``.
+        content_type: Content type of the affected row, when known.
+        created_at: The *stored* ISO-8601 timestamp text of the affected row.
+        embedding: Serialised embedding BLOB, when known.
+    """
+
+    generation: int
+    kind: str
+    item_id: Optional[int] = None
+    item_ids: tuple[int, ...] = ()
+    content_type: Optional[str] = None
+    created_at: Optional[str] = None
+    embedding: Optional[bytes] = None
+
+
+@runtime_checkable
+class DatabaseListener(Protocol):
+    """Anything that wants to be told about committed item changes."""
+
+    def on_database_change(self, change: DatabaseChange) -> None:
+        """Handle one committed change (called while the writer holds the lock)."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +294,9 @@ class Database(AbstractContextManager["Database"]):
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
         self._lock = threading.RLock()
+        #: Weakly-held listeners, so a dropped searcher is never leaked here.
+        self._listeners: "weakref.WeakSet[DatabaseListener]" = weakref.WeakSet()
+        self._change_counter = 0
         self._conn = sqlite3.connect(
             str(self.path), check_same_thread=False, timeout=30.0
         )
@@ -330,18 +391,22 @@ class Database(AbstractContextManager["Database"]):
 
             self._conn.commit()
             record = self.get_by_id(cursor.lastrowid)
+            self._publish(
+                DatabaseChange(
+                    generation=0,
+                    kind="insert",
+                    item_id=record.id if record is not None else cursor.lastrowid,
+                    content_type=content_type,
+                    created_at=timestamp,
+                    embedding=embedding,
+                )
+            )
             return InsertResult(True, "inserted", record=record)
 
     @staticmethod
     def _coerce_timestamp(value: Optional[datetime | str]) -> str:
         """Normalise ``value`` to a UTC ISO-8601 string."""
-        if value is None:
-            return utcnow_iso()
-        if isinstance(value, str):
-            return value
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+        return coerce_timestamp(value)
 
     def delete_all(self) -> int:
         """Delete every stored entry and return the number of rows removed."""
@@ -350,6 +415,8 @@ class Database(AbstractContextManager["Database"]):
             self._conn.execute("DELETE FROM items")
             self._conn.execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')")
             self._conn.commit()
+            if count:
+                self._publish(DatabaseChange(generation=0, kind="clear"))
             return int(count)
 
     def delete_by_id(self, item_id: int) -> bool:
@@ -361,6 +428,10 @@ class Database(AbstractContextManager["Database"]):
         with self._lock:
             cursor = self._conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
             self._conn.commit()
+            if cursor.rowcount > 0:
+                self._publish(
+                    DatabaseChange(generation=0, kind="delete", item_id=item_id)
+                )
             return cursor.rowcount > 0
 
     def delete_older_than(self, cutoff: datetime | str) -> int:
@@ -374,11 +445,23 @@ class Database(AbstractContextManager["Database"]):
             ``items_ad`` trigger on each deleted row.
         """
         with self._lock:
+            boundary = self._coerce_timestamp(cutoff)
+            ids = [
+                int(row["id"])
+                for row in self._conn.execute(
+                    "SELECT id FROM items WHERE created_at < ?", (boundary,)
+                ).fetchall()
+            ]
             cursor = self._conn.execute(
-                "DELETE FROM items WHERE created_at < ?",
-                (self._coerce_timestamp(cutoff),),
+                "DELETE FROM items WHERE created_at < ?", (boundary,)
             )
             self._conn.commit()
+            if ids:
+                self._publish(
+                    DatabaseChange(
+                        generation=0, kind="delete_many", item_ids=tuple(ids)
+                    )
+                )
             return int(cursor.rowcount)
 
     def vacuum(self) -> None:
@@ -420,14 +503,78 @@ class Database(AbstractContextManager["Database"]):
         """Persist the pause flag so ``watch`` can honour it live."""
         self.set_meta(PAUSED_META_KEY, "1" if paused else "0")
 
+    def get_embedding_model(self) -> Optional[str]:
+        """Return the model that produced the stored embeddings, if recorded."""
+        return self.get_meta(EMBEDDING_MODEL_META_KEY)
+
+    def set_embedding_model(self, model_name: str) -> None:
+        """Record which embedding model the stored vectors came from."""
+        self.set_meta(EMBEDDING_MODEL_META_KEY, model_name)
+
     def set_embedding(self, item_id: int, embedding: bytes) -> bool:
         """Attach a serialised embedding to an existing row (Phase 2 hook)."""
         with self._lock:
+            meta = self._conn.execute(
+                "SELECT content_type, created_at FROM items WHERE id = ?", (item_id,)
+            ).fetchone()
             cursor = self._conn.execute(
                 "UPDATE items SET embedding = ? WHERE id = ?", (embedding, item_id)
             )
             self._conn.commit()
+            if cursor.rowcount > 0 and meta is not None:
+                self._publish(
+                    DatabaseChange(
+                        generation=0,
+                        kind="embedding",
+                        item_id=item_id,
+                        content_type=meta["content_type"],
+                        created_at=meta["created_at"],
+                        embedding=embedding,
+                    )
+                )
             return cursor.rowcount > 0
+
+    # ------------------------------------------------------------- change feed
+
+    @property
+    def change_counter(self) -> int:
+        """Monotonic counter, incremented once per committed item change.
+
+        Reading it needs no lock: it is a single integer attribute, so a stale
+        read at worst causes one extra reload.
+        """
+        return self._change_counter
+
+    def add_listener(self, listener: "DatabaseListener") -> None:
+        """Register a listener; ``listener`` is held weakly."""
+        self._listeners.add(listener)
+
+    def remove_listener(self, listener: "DatabaseListener") -> None:
+        """Unregister a previously added listener."""
+        self._listeners.discard(listener)
+
+    def _publish(self, change: DatabaseChange) -> None:
+        """Bump the counter and notify listeners (must hold ``self._lock``).
+
+        Notifications run while the writer still holds the lock so listeners
+        observe changes in counter order; listeners must therefore never call
+        back into the database.
+        """
+        self._change_counter += 1
+        stamped = DatabaseChange(
+            generation=self._change_counter,
+            kind=change.kind,
+            item_id=change.item_id,
+            item_ids=change.item_ids,
+            content_type=change.content_type,
+            created_at=change.created_at,
+            embedding=change.embedding,
+        )
+        for listener in list(self._listeners):
+            try:
+                listener.on_database_change(stamped)
+            except Exception:  # pragma: no cover - a listener must not break writes
+                logger.exception("database listener failed for %s", stamped.kind)
 
     # ------------------------------------------------------------------- reads
 
@@ -612,6 +759,28 @@ class Database(AbstractContextManager["Database"]):
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [ClipRecord.from_row(row) for row in rows]
+
+    def index_snapshot(self) -> tuple[int, list[tuple[int, str, str, bytes]]]:
+        """Return ``(generation, rows)`` for every embedded entry, atomically.
+
+        Used to build the in-memory embedding index once. Each row is
+        ``(id, content_type, created_at, embedding_blob)`` where ``created_at``
+        is the *stored* ISO-8601 text, so the index can filter by date with the
+        exact same string comparisons the SQL layer uses.
+
+        The generation is read under the same lock as the rows, so a change
+        committed afterwards always has a strictly greater ``change_counter``.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content_type, created_at, embedding FROM items "
+                "WHERE embedding IS NOT NULL ORDER BY created_at DESC, id DESC"
+            ).fetchall()
+            generation = self._change_counter
+        return generation, [
+            (int(row["id"]), row["content_type"], row["created_at"], row["embedding"])
+            for row in rows
+        ]
 
     def indexed_fingerprint(
         self,

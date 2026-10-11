@@ -45,6 +45,45 @@ def test_get_embedder_returns_a_cached_singleton(monkeypatch) -> None:
         reset_embedder_cache()
 
 
+def test_get_embedder_applies_model_prefix_presets() -> None:
+    reset_embedder_cache()
+    try:
+        bge = get_embedder(
+            Config(db_path=":memory:").with_overrides(
+                embedding_model="BAAI/bge-small-en-v1.5"
+            )
+        )
+        assert bge.query_prefix.startswith("Represent this sentence")
+        assert bge.document_prefix == ""
+
+        e5 = get_embedder(
+            Config(db_path=":memory:").with_overrides(
+                embedding_model="intfloat/e5-small-v2"
+            )
+        )
+        assert (e5.query_prefix, e5.document_prefix) == ("query: ", "passage: ")
+
+        plain = get_embedder(Config(db_path=":memory:"))
+        assert (plain.query_prefix, plain.document_prefix) == ("", "")
+    finally:
+        reset_embedder_cache()
+
+
+def test_explicit_config_prefixes_override_presets() -> None:
+    reset_embedder_cache()
+    try:
+        embedder = get_embedder(
+            Config(db_path=":memory:").with_overrides(
+                embedding_model="BAAI/bge-small-en-v1.5",
+                embedding_query_prefix="Q: ",
+                embedding_document_prefix="D: ",
+            )
+        )
+        assert (embedder.query_prefix, embedder.document_prefix) == ("Q: ", "D: ")
+    finally:
+        reset_embedder_cache()
+
+
 def test_missing_sentence_transformers_gives_an_actionable_error(monkeypatch) -> None:
     # ``None`` in sys.modules makes `from sentence_transformers import ...`
     # raise ImportError even when the package is installed.

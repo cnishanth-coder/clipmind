@@ -24,7 +24,13 @@ from typing import Callable, Iterable, Optional, Sequence
 from ..config import Config
 from ..storage.db import Database
 from .codec import encode_vector
-from .encoder import Embedder, EmbeddingModelUnavailable, get_embedder, is_embeddable
+from .encoder import (
+    Embedder,
+    EmbeddingModelMismatch,
+    EmbeddingModelUnavailable,
+    get_embedder,
+    is_embeddable,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +89,15 @@ def embed_batch(
         except Exception:
             logger.exception("storing embedding for item %d failed", item.item_id)
             failed += 1
+
+    # Record which model produced these vectors so a later model change can be
+    # detected and force a reindex instead of silently mixing vector spaces.
+    model_name = getattr(embedder, "model_name", None)
+    if embedded and model_name:
+        try:
+            db.set_embedding_model(str(model_name))
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("recording the embedding model failed")
     return embedded, failed
 
 
@@ -308,6 +323,8 @@ class ReindexReport:
     embedded: int
     failed: int
     seconds: float
+    #: True when the sweep recomputed every row (``reindex --force``).
+    forced: bool = False
 
 
 def reindex_pending(
@@ -317,11 +334,13 @@ def reindex_pending(
     config: Optional[Config] = None,
     progress: Optional[ProgressCallback] = None,
     batch_size: Optional[int] = None,
+    force: bool = False,
 ) -> ReindexReport:
     """Embed every eligible row that has no embedding yet.
 
     Rows already carrying an embedding are never touched, which makes this
-    safe (and cheap) to re-run at any time.
+    safe (and cheap) to re-run at any time. With ``force=True`` every eligible
+    row is re-embedded instead, which is what a model change requires.
 
     Args:
         db: Database to sweep.
@@ -330,6 +349,11 @@ def reindex_pending(
         progress: Optional ``progress(done, total)`` callback, called per batch
             and once at the end.
         batch_size: Overrides ``config.embedding_batch_size``.
+        force: Re-embed rows that already have an embedding.
+
+    Raises:
+        EmbeddingModelMismatch: If the stored vectors came from a different
+            model and ``force`` is not set.
 
     Returns:
         A :class:`ReindexReport`.
@@ -339,10 +363,21 @@ def reindex_pending(
     embedder = embedder or get_embedder(config)
     size = batch_size or config.embedding_batch_size
 
-    missing_records = list(db.iter_missing_embeddings())
+    stored = db.get_embedding_model()
+    if stored is not None and stored != config.embedding_model and not force:
+        raise EmbeddingModelMismatch(
+            f"stored embeddings were created with model {stored!r}, but the "
+            f"configured model is {config.embedding_model!r}. Run "
+            "`clipmind reindex --force` to rebuild them for the new model."
+        )
+
+    if force:
+        scanned = list(db.list_recent(limit=0))
+    else:
+        scanned = list(db.iter_missing_embeddings())
     eligible: list[EmbedItem] = [
         EmbedItem(record.id, record.content, record.content_type)
-        for record in missing_records
+        for record in scanned
         if is_embeddable(record.content, record.content_type, config)
     ]
 
@@ -358,13 +393,18 @@ def reindex_pending(
     if progress is not None and total == 0:
         progress(0, 0)
 
+    model_name = getattr(embedder, "model_name", None)
+    if force and embedded and model_name:
+        db.set_embedding_model(str(model_name))
+
     return ReindexReport(
-        missing=len(missing_records),
+        missing=len(scanned),
         eligible=total,
-        skipped=len(missing_records) - total,
+        skipped=len(scanned) - total,
         embedded=embedded,
         failed=failed,
         seconds=time.monotonic() - started,
+        forced=force,
     )
 
 

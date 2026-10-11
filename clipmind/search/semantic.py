@@ -3,30 +3,39 @@
 The public entry point is :meth:`SemanticSearcher.search` (and the module-level
 :func:`search_semantic` convenience wrapper). It embeds the query with the same
 local model used for ingestion, then ranks stored vectors by cosine similarity
-through the :class:`~clipmind.search.vector_index.VectorIndex` interface.
+through a long-lived, in-memory :class:`~clipmind.search.embedding_index.EmbeddingIndex`.
+
+The index is built once (from a single SQLite snapshot) and then kept in sync
+with the database incrementally: the searcher registers itself as a
+:class:`~clipmind.storage.db.DatabaseListener` and folds each committed insert,
+embedding, delete, purge and clear into the matrix. Time and type filters are
+boolean masks over the row-aligned metadata arrays, so a filtered query is a
+masked matmul - never a re-read of the table.
 
 Query planning (time phrases, hybrid weighting) is Phase 3 and deliberately
-absent here: this module only answers "which stored entries mean the most
-similar thing?".
+absent here: this module only answers \"which stored entries mean the most
+similar thing?\".
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Optional
 
 from ..config import Config
-from ..embeddings.codec import stack_vectors
-from ..embeddings.encoder import Embedder, get_embedder
-from ..storage.db import ClipRecord, Database
-from .vector_index import NumpyVectorIndex, VectorIndex
+from ..embeddings.encoder import (
+    Embedder,
+    EmbeddingModelMismatch,
+    embed_queries,
+    get_embedder,
+)
+from ..storage.db import ClipRecord, Database, DatabaseChange
+from .embedding_index import EmbeddingIndex
 
 logger = logging.getLogger(__name__)
-
-#: Factory used to build an index from decoded vectors.
-IndexFactory = Callable[[list[int], object], VectorIndex]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,17 +81,20 @@ class SearchResult:
         return self.record.preview(max_len)
 
     def relative_time(self, now: Optional[datetime] = None) -> str:
-        """Return a short age string such as ``"3m ago"``."""
+        """Return a short age string such as ``\"3m ago\"``."""
         return self.record.relative_time(now)
 
 
 class SemanticSearcher:
     """Rank stored entries by semantic similarity to a query.
 
-    Rebuilding the numpy matrix on every query would be wasteful for the
-    Phase 5 UI (searches per keystroke), so the decoded index is cached and
-    invalidated by a cheap ``(row_count, max_id)`` fingerprint. Instances are
-    not thread-safe: the ``last_*`` diagnostics describe the most recent call.
+    One searcher owns one :class:`EmbeddingIndex`. The index is loaded lazily on
+    the first query and then updated in place as the database changes, so the
+    per-query cost is a masked matmul plus one model forward pass - not a full
+    re-read of every embedding BLOB.
+
+    Instances are safe to share between threads. The ``last_*`` diagnostics
+    describe the most recent call.
     """
 
     def __init__(
@@ -91,32 +103,29 @@ class SemanticSearcher:
         *,
         embedder: Optional[Embedder] = None,
         config: Optional[Config] = None,
-        index_factory: Optional[IndexFactory] = None,
     ) -> None:
         """Create a searcher.
 
         Args:
-            db: Database holding the entries and their embeddings.
+            db: Database holding the entries and their embeddings. The searcher
+                registers as a listener so it sees committed changes.
             embedder: Embedder for the query text; resolved lazily from config
                 when omitted (so constructing a searcher never loads the model).
             config: Configuration (default top-k, minimum score).
-            index_factory: Builds the vector index; defaults to
-                :class:`~clipmind.search.vector_index.NumpyVectorIndex`.
         """
         self.db = db
         self.config = config or Config()
         self._embedder = embedder
-        self._index_factory = index_factory or (
-            lambda keys, vectors: NumpyVectorIndex(keys, vectors)
-        )
-        self._cache: dict[
-            tuple[Optional[str], Optional[str], Optional[str]],
-            tuple[tuple[int, int], list[ClipRecord], VectorIndex],
-        ] = {}
+        self._index = EmbeddingIndex()
+        self._index_loaded = False
+        self._index_generation = -1
+        self._index_lock = threading.RLock()
 
         self.last_best_score: Optional[float] = None
         self.last_index_size: int = 0
         self.last_threshold: float = self.config.min_score
+
+        db.add_listener(self)
 
     # ------------------------------------------------------------------ embedding
 
@@ -129,6 +138,12 @@ class SemanticSearcher:
 
     # ------------------------------------------------------------------ index
 
+    @property
+    def index(self) -> EmbeddingIndex:
+        """Return the underlying long-lived index (ensuring it is loaded)."""
+        self._ensure_index()
+        return self._index
+
     def index_size(
         self,
         content_type: Optional[str] = None,
@@ -137,56 +152,73 @@ class SemanticSearcher:
         until: Optional[datetime] = None,
     ) -> int:
         """Return how many embedded entries the given filter covers."""
-        _records, index = self._index(content_type, since, until)
-        return index.size
+        self._ensure_index()
+        return self._index.count(
+            content_type=content_type, since=since, until=until
+        )
 
     def invalidate(self) -> None:
-        """Drop the cached index (call after external writes)."""
-        self._cache.clear()
+        """Drop the cached index so the next query reloads it from the database."""
+        with self._index_lock:
+            self._index.clear()
+            self._index_loaded = False
+            self._index_generation = -1
 
-    def _index(
-        self,
-        content_type: Optional[str],
-        since: Optional[datetime],
-        until: Optional[datetime],
-    ) -> tuple[list[ClipRecord], VectorIndex]:
-        """Return cached ``(records, index)`` for the given filters.
+    def on_database_change(self, change: DatabaseChange) -> None:
+        """Fold one committed change into the in-memory index.
 
-        The cache key includes the time bounds because a different range
-        selects a different subset of rows and therefore a different matrix.
+        Called by the database while the writer holds its lock; this method only
+        touches the index (never the database) to avoid lock inversion.
         """
-        fingerprint = self.db.indexed_fingerprint(content_type, since=since, until=until)
-        cache_key = (
-            content_type,
-            since.isoformat() if since else None,
-            until.isoformat() if until else None,
-        )
-        cached = self._cache.get(cache_key)
-        if cached is not None and cached[0] == fingerprint:
-            return cached[1], cached[2]
+        with self._index_lock:
+            if not self._index_loaded:
+                # A snapshot taken later will include this change; before loading
+                # there is nothing to update.
+                return
+            self._index.apply(change)
+            self._index_generation = change.generation
 
-        records = self.db.list_indexed(content_type, since=since, until=until)
-        keys = [record.id for record in records]
-        vectors = self._decode(records)
-        index = self._index_factory(keys, vectors)
-        self._cache[cache_key] = (fingerprint, records, index)
-        logger.debug(
-            "built vector index: %d vectors for type=%s range=%s..%s",
-            index.size,
-            content_type,
-            cache_key[1],
-            cache_key[2],
-        )
-        return records, index
+    def _check_embedding_model(self) -> None:
+        """Refuse to search when the stored vectors came from another model.
 
-    @staticmethod
-    def _decode(records: list[ClipRecord]):
-        """Decode the embedding BLOBs of ``records`` into an ``(n, dim)`` matrix.
-
-        ``Database.list_indexed`` only returns rows with a non-NULL embedding,
-        so the blob list aligns 1:1 with ``records`` and with the index keys.
+        A database that predates model tagging has embeddings but no recorded
+        model name; it is adopted silently under the configured model so the
+        upgrade needs no manual step. Once a name is recorded, changing the
+        configured model is a hard error until ``reindex --force`` rebuilds the
+        vectors (they are not comparable across models, and the dimension can
+        differ too).
         """
-        return stack_vectors([record.embedding or b"" for record in records])
+        stored = self.db.get_embedding_model()
+        configured = self.config.embedding_model
+        if stored is None:
+            if self.db.indexed_fingerprint()[0] > 0:
+                self.db.set_embedding_model(configured)
+            return
+        if stored != configured:
+            raise EmbeddingModelMismatch(
+                f"stored embeddings were created with model {stored!r}, but the "
+                f"configured model is {configured!r}. Run `clipmind reindex --force` "
+                "to rebuild them for the new model."
+            )
+
+    def _ensure_index(self) -> None:
+        """Load the index on first use and refresh it if a change was missed."""
+        with self._index_lock:
+            if self._index_loaded and self.db.change_counter == self._index_generation:
+                return
+            first_load = not self._index_loaded
+        if first_load:
+            self._check_embedding_model()
+        # Take the snapshot outside the index lock: the database lock must never
+        # be acquired while holding it (listeners acquire it in the other order).
+        generation, rows = self.db.index_snapshot()
+        with self._index_lock:
+            if self._index_loaded and self._index_generation >= generation:
+                return  # an incremental update already covered this snapshot
+            self._index.load(rows)
+            self._index_loaded = True
+            self._index_generation = generation
+            logger.debug("loaded embedding index: %d vectors", self._index.size)
 
     # ------------------------------------------------------------------ search
 
@@ -205,7 +237,7 @@ class SemanticSearcher:
         Args:
             query: Natural-language query text.
             top_k: Maximum number of results (defaults to ``config.search_top_k``).
-            content_type: Restrict to one content type (``"code"``, ``"url"``...).
+            content_type: Restrict to one content type (``\"code\"``, ``\"url\"``...).
             min_score: Minimum cosine similarity to keep a hit; defaults to
                 ``config.min_score``. Raise it for precision, lower it for recall.
             since: Only consider entries created at or after this instant.
@@ -227,23 +259,40 @@ class SemanticSearcher:
             self.last_index_size = 0
             return []
 
-        records, index = self._index(content_type, since, until)
-        self.last_index_size = index.size
-        if index.size == 0:
+        self._ensure_index()
+        index_size = self._index.count(
+            content_type=content_type, since=since, until=until
+        )
+        self.last_index_size = index_size
+        if index_size == 0:
             # Nothing to compare against - do not even load the model.
             self.last_best_score = None
             return []
 
-        query_vector = self.embedder.embed_texts([query])[0]
-        hits = index.search(query_vector, top_k)
+        # The model call is deliberately outside the index lock: a slow forward
+        # pass must not block the embedding worker's incremental updates.
+        query_vector = embed_queries(self.embedder, [query])[0]
+        if query_vector.shape[0] != self._index.dimension:
+            raise EmbeddingModelMismatch(
+                f"stored embeddings have {self._index.dimension} dimensions but the "
+                f"configured model {self.config.embedding_model!r} produces "
+                f"{query_vector.shape[0]}. Run `clipmind reindex --force` to rebuild "
+                "them for the new model."
+            )
+        hits = self._index.search(
+            query_vector,
+            top_k,
+            content_type=content_type,
+            since=since,
+            until=until,
+        )
         self.last_best_score = hits[0].score if hits else None
 
-        by_id = {record.id: record for record in records}
         results: list[SearchResult] = []
         for hit in hits:
             if hit.score < threshold:
                 continue
-            record = by_id.get(hit.key)
+            record = self.db.get_by_id(hit.key)
             if record is not None:
                 results.append(SearchResult(record=record, score=hit.score))
         return results

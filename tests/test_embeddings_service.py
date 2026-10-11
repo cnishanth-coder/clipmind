@@ -9,7 +9,9 @@ import pytest
 from clipmind.capture.monitor import ClipboardMonitor
 from clipmind.config import Config
 from clipmind.embeddings.codec import decode_vector
+from clipmind.embeddings.codec import encode_vector
 from clipmind.embeddings.encoder import (
+    EmbeddingModelMismatch,
     EmbeddingModelUnavailable,
     SentenceTransformerEmbedder,
     is_embeddable,
@@ -76,6 +78,41 @@ def test_is_embeddable_honours_custom_skip_types() -> None:
     config = _config(embedding_skip_types=frozenset({"url"}))
     assert is_embeddable("https://react.dev", "url", config) is False
     assert is_embeddable("12345678", "number", config) is True
+
+
+# ------------------------------------------------------------ model switches
+
+
+def _store_embedding(db: Database, content: str, *, model: Optional[str] = None) -> int:
+    """Insert ``content`` with an embedding and optionally tag the model."""
+    result = db.insert_clip(content, content_type="text")
+    assert result.inserted and result.record is not None
+    db.set_embedding(result.record.id, encode_vector(FakeEmbedder().embed_one(content)))
+    if model:
+        db.set_embedding_model(model)
+    return result.record.id
+
+
+def test_reindex_refuses_a_model_change_without_force(db: Database) -> None:
+    _store_embedding(db, "an embedded row", model="all-MiniLM-L6-v2")
+    new_config = _config(embedding_model="BAAI/bge-small-en-v1.5")
+
+    with pytest.raises(EmbeddingModelMismatch):
+        reindex_pending(db, embedder=FakeEmbedder(), config=new_config)
+
+
+def test_force_reindex_recomputes_every_row(db: Database) -> None:
+    _store_embedding(db, "already embedded", model="all-MiniLM-L6-v2")
+    _store_embedding(db, "also embedded", model="all-MiniLM-L6-v2")
+    new_config = _config(embedding_model="BAAI/bge-small-en-v1.5")
+
+    report = reindex_pending(
+        db, embedder=FakeEmbedder(), config=new_config, force=True
+    )
+
+    assert report.forced is True
+    assert report.embedded == 2
+    assert db.get_embedding_model() == "all-MiniLM-L6-v2"  # fake has no model_name
 
 
 def test_is_embeddable_honours_min_chars() -> None:

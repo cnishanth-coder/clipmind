@@ -73,7 +73,46 @@ DEFAULT_LIST_LIMIT = 20
 DEFAULT_OVERSIZE_POLICY = "truncate"
 
 #: Local sentence-transformers model used for embeddings (384-dim).
+#: The Task 2 benchmark measured ``sentence-transformers/all-mpnet-base-v2``
+#: ranking higher (hybrid top-5 80% vs 71% overall, 80% vs 60% on code queries)
+#: but at ~4.8x the weights, ~1.7x the query latency, half the embedding
+#: throughput, and it needs ``min_score`` re-tuned - so it is an opt-in upgrade,
+#: not the default. Set ``embedding_model`` to it (with a ``reindex --force``)
+#: to trade size for quality.
 DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+
+#: Prefixes some as-of-retrieval models expect around query/document text.
+#: Leave empty to use the model's built-in preset (see ``MODEL_PREFIXES``).
+DEFAULT_EMBEDDING_QUERY_PREFIX = ""
+DEFAULT_EMBEDDING_DOCUMENT_PREFIX = ""
+
+#: Prefix presets for models that require them, as ``(query, document)``.
+#: ``all-MiniLM-L6-v2`` and ``all-mpnet-base-v2`` need none; BGE wants a query
+#: instruction before the query only; E5 wants ``query:`` / ``passage:`` on both.
+#: Getting this wrong measurably hurts retrieval, so the benchmark applies the
+#: same prefixes production would.
+MODEL_PREFIXES: dict[str, tuple[str, str]] = {
+    "BAAI/bge-small-en-v1.5": (
+        "Represent this sentence for searching relevant passages: ",
+        "",
+    ),
+    "BAAI/bge-base-en-v1.5": (
+        "Represent this sentence for searching relevant passages: ",
+        "",
+    ),
+    "BAAI/bge-large-en-v1.5": (
+        "Represent this sentence for searching relevant passages: ",
+        "",
+    ),
+    "intfloat/e5-small-v2": ("query: ", "passage: "),
+    "intfloat/e5-base-v2": ("query: ", "passage: "),
+    "intfloat/e5-large-v2": ("query: ", "passage: "),
+}
+
+
+def model_prefixes(model_name: str) -> tuple[str, str]:
+    """Return the ``(query, document)`` prefix preset for ``model_name``."""
+    return MODEL_PREFIXES.get(model_name, ("", ""))
 
 #: Texts per forward pass when embedding.
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
@@ -370,6 +409,8 @@ _FIELD_VALIDATORS: dict[str, Callable[[str, object], object]] = {
     "embedding_min_chars": lambda k, v: _positive_int(k, v, minimum=0),
     "embedding_skip_types": _string_frozenset,
     "embedding_device": _optional_string,
+    "embedding_query_prefix": _string,
+    "embedding_document_prefix": _string,
     "min_score": _unit_float,
     "search_top_k": lambda k, v: _positive_int(k, v),
     "semantic_weight": lambda k, v: _positive_float(k, v),
@@ -450,6 +491,9 @@ def default_config_toml() -> str:
         f"embedding_min_chars = {DEFAULT_EMBEDDING_MIN_CHARS}\n"
         'embedding_skip_types = ["number"]\n'
         "# embedding_device = \"cpu\"\n"
+        "# Prefixes for retrieval models that need them (empty = model preset).\n"
+        '# embedding_query_prefix = ""\n'
+        '# embedding_document_prefix = ""\n'
         "\n"
         "# --- privacy (Phase 4) ---\n"
         f"privacy_enabled = {'true' if DEFAULT_PRIVACY_ENABLED else 'false'}\n"
@@ -531,6 +575,9 @@ class Config:
         embedding_skip_types: Content types that are never embedded.
         embedding_device: Torch device (``"cpu"``, ``"mps"``, ``"cuda"``) or
             ``None`` to let sentence-transformers choose.
+        embedding_query_prefix: Text prepended to queries before embedding;
+            empty uses the model's built-in preset (see :data:`MODEL_PREFIXES`).
+        embedding_document_prefix: Text prepended to documents before embedding.
         min_score: Minimum combined (hybrid) score for a result to be kept.
         search_top_k: Default number of search results.
         semantic_weight: Weight of the semantic score in ``final_score``.
@@ -569,6 +616,8 @@ class Config:
     embedding_min_chars: int = DEFAULT_EMBEDDING_MIN_CHARS
     embedding_skip_types: frozenset[str] = DEFAULT_EMBEDDING_SKIP_TYPES
     embedding_device: str | None = None
+    embedding_query_prefix: str = DEFAULT_EMBEDDING_QUERY_PREFIX
+    embedding_document_prefix: str = DEFAULT_EMBEDDING_DOCUMENT_PREFIX
     min_score: float = DEFAULT_MIN_SCORE
     search_top_k: int = DEFAULT_TOP_K
     semantic_weight: float = DEFAULT_SEMANTIC_WEIGHT

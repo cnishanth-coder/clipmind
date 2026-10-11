@@ -34,8 +34,13 @@ the one-time download of the ~90 MB embedding model.
   search-as-you-type, type filters, copy-back, delete + undo, and a tray menu
   (pause, clear, config, quit).
 - 🧠 **One warm model per process** — the embedding model loads once on a
-  background thread; capture and the UI never block on it.
-- ✅ **460 fast tests** (no model, no network) plus 6 real-model integration
+  background thread, and the semantic index is built once and updated
+  incrementally, so searches never re-read the embedding table.
+- 🔀 **A configurable, measured embedding model** — the benchmark compares three
+  local models and reports the trade-offs; the smaller default is kept, and
+  switching is one config key. Existing databases are protected by a model tag
+  that requires `reindex --force`.
+- ✅ **483 fast tests** (no model, no network) plus 6 real-model integration
   tests, and a reproducible benchmark harness.
 
 ---
@@ -73,7 +78,10 @@ A clipboard icon appears in the menu bar (no Dock icon), and `Cmd+Shift+V`
 (Windows/Linux: `Ctrl+Shift+V`) opens the popup. The first run downloads the
 `all-MiniLM-L6-v2` weights (~90 MB) into `~/.cache/huggingface`; capture, the
 tray and keyword search all work while that happens, and everything is offline
-afterwards.
+afterwards. For higher retrieval quality, set `embedding_model` to
+`sentence-transformers/all-mpnet-base-v2` (or the `CLIPMIND_EMBED_MODEL` env var)
+and run `clipmind reindex --force` — see [Benchmarks](#benchmarks) for the
+measured trade-off.
 
 Prefer the command line? Everything works without the UI:
 
@@ -177,10 +185,16 @@ sequenceDiagram
   `[REDACTED:kind]` form is hashed, embedded and indexed — the raw value never
   reaches the database, the FTS index or the model.
 - **Embeddings are float32 BLOBs, not pickles.** 384 dims × 4 bytes = 1536 bytes
-  per row, readable from any language, no `.npy` header.
+  per row for the default `all-MiniLM-L6-v2` (768 dims × 4 = 3072 for
+  `all-mpnet-base-v2`), readable from any language, no `.npy` header.
+- **The stored model name guards the vector space.** Every batch of embeddings
+  records which model produced it; if the configured model changes, search and
+  `reindex` refuse until `clipmind reindex --force` rebuilds the vectors, so two
+  incomparable vector spaces are never mixed.
 - **The model is a lazy singleton** keyed by `(model_name, device)`. Importing the
   package never imports torch; the first `embed_texts` pays for the load, on the
-  worker thread.
+  worker thread. Query/document prefixes come from the model's preset (BGE, E5)
+  or from `embedding_query_prefix`/`embedding_document_prefix`.
 - **Search is behind a `VectorIndex` protocol.** Swapping in FAISS/Chroma means
   writing a class with `size` and `search`; nothing else changes.
 - **User text never reaches the FTS5 parser.** Queries are reduced to quoted
@@ -297,11 +311,13 @@ clipmind search "database query" [--top 5] [--type code] [--min-score 0.25]
 clipmind search "react hooks yesterday" --explain
 clipmind search "ERR_4021" --keyword-only      # pure FTS5, no model needed
 clipmind search "database query" --semantic-only
-clipmind reindex [--batch 32]                  # embed rows that have none yet
+clipmind reindex [--batch 32] [--force]       # embed rows that have none yet
+                                              # --force re-embeds everything (model change)
 ```
 
 `search` flags: `--top N`, `-t/--type`, `--min-score S`, `--semantic-only`,
-`--keyword-only`, `--explain`, `--json`.
+`--keyword-only`, `--explain`, `--json`. `reindex` flags: `--batch N`, `--force`,
+`--quiet`.
 
 ### Store text directly (demo/scripting)
 
@@ -340,6 +356,9 @@ Common keys:
 poll_interval = 0.5
 max_chars = 10000
 dedup = true
+embedding_model = "all-MiniLM-L6-v2"   # or sentence-transformers/all-mpnet-base-v2
+# embedding_query_prefix = ""       # empty = the model's built-in preset
+# embedding_document_prefix = ""
 min_score = 0.25
 search_top_k = 5
 semantic_weight = 0.7
@@ -487,9 +506,11 @@ For reference, the on-disk sizes of the components PyInstaller packs (from
 | numpy | 108 MB |
 | transformers | 92 MB |
 | `all-MiniLM-L6-v2` weights (HF cache) | 87 MB |
+| `all-mpnet-base-v2` weights (HF cache) | 438 MB |
 | **whole venv** | **2.4 GB** |
 
-Add roughly **+87 MB uncompressed** if you pass `--bundle-model`.
+Add roughly **+87 MB uncompressed** if you pass `--bundle-model` (**+438 MB** if
+you bundle `all-mpnet-base-v2` via `CLIPMIND_BUNDLE_MODEL_NAME`).
 
 ### Unsigned-app workaround
 
@@ -518,37 +539,41 @@ notarising. The other build warnings (Windows/Linux ctypes libraries such as
 Reproduce with `python benchmarks/bench_search.py` — it regenerates
 [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md), including the per-query ranks.
 The corpus (10,000 synthetic entries, fixed seed, timestamps spread over 90 days)
-and the 30 hand-written labelled `query → expected entry` pairs are deterministic;
-timings are machine-dependent.
+and the 45 hand-written labelled `query → expected entry` pairs (30 general + 15
+code-focused) are deterministic; timings are machine-dependent.
 
 **Measured on** Intel Core i9-9880H @ 2.30 GHz, macOS 26.6.2 (x86_64), Python
-3.12.15, PyTorch 2.2.2 (8 threads), sentence-transformers 3.4.1, model
-`all-MiniLM-L6-v2`, device `mps:0` (auto-selected). One run; the machine was
-otherwise idle. See [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for the run
-these numbers came from and for p99/mean/max.
+3.12.15, PyTorch 2.2.2 (8 threads), sentence-transformers 3.4.1, device `mps:0`
+(auto-selected). One run; the machine was otherwise idle. See
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for the raw numbers, p99/mean/max
+and every per-query rank.
 
-| Metric | Result |
-| --- | ---: |
-| Corpus | 10,000 entries |
-| Embedding throughput | 372 texts/s |
-| semantic search (p50 / p95) | 228 ms / 419 ms |
-| keyword search (p50 / p95) | 5 ms / 13 ms |
-| hybrid search (p50 / p95) | 234 ms / 369 ms |
-| semantic top-5 quality | 70% |
-| keyword top-5 quality | 53% |
-| hybrid top-5 quality | 73% |
+**Task 1 — index reuse.** Semantic p50 fell from **228 ms to 44 ms** (hybrid
+234 ms → 50 ms) once the index is built once and updated incrementally instead of
+re-read per query (`all-MiniLM-L6-v2`, same corpus).
 
-Model load (first call) was **9.0 s**; embedding the whole corpus took **26.9 s**.
-Hybrid ranking beats both single modes at top-5. Timings vary run to run with
-host load (an earlier run on the same machine measured 501 texts/s and a 213 ms
-semantic p50); the corpus and the quality figures are reproducible.
+**Task 2 — model comparison (default kept: `all-MiniLM-L6-v2`).**
 
-> The semantic latency is dominated by **index rebuilding**, not the model: every
-> `hybrid_search` call constructs a fresh `SemanticSearcher`, so its decoded-index
-> cache never hits and each query re-reads all 10,000 embedding blobs from SQLite.
-> Reusing one searcher across queries is the obvious optimisation (see
-> [Roadmap](#roadmap)). Full detail and caveats are in
-> [`benchmarks/RESULTS.md`](benchmarks/RESULTS.md).
+| Model | Dim | Weights | Embed | semantic p50 | hybrid top-5 | code top-5 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `all-MiniLM-L6-v2` | 384 | 91 MB | 451 texts/s | 44 ms | 71% | 60% |
+| `BAAI/bge-small-en-v1.5` | 384 | 133 MB | 398 texts/s | 75 ms | 58% | 48% |
+| `sentence-transformers/all-mpnet-base-v2` | 768 | 438 MB | 251 texts/s | 82 ms | **80%** | **80%** |
+
+`all-mpnet-base-v2` ranked highest: **+8.9 points** hybrid top-5 overall and
+**+20 points** on the 15 code-focused queries. It was not adopted as the default
+because the total cost is not clearly acceptable for a lightweight local tool —
+4.8x the weights (438 MB vs 91 MB), 1.7x the hybrid latency (86 ms vs 50 ms p50),
+half the embedding throughput, and it needs `min_score` re-tuned (at the shipped
+threshold a relevant hit drops out). It remains a one-key opt-in:
+`embedding_model = "sentence-transformers/all-mpnet-base-v2"` (or
+`CLIPMIND_EMBED_MODEL`) plus `clipmind reindex --force`. BGE's recommended query
+instruction was applied; it still measured below MiniLM here.
+
+For the default model the detailed figures are: load **7.5 s**, corpus embedding
+**22.2 s** (**451 texts/s**), hybrid p50/p95 **50 ms / 62 ms**, hybrid top-5
+**71%** (60% keyword, 69% semantic). Timings vary run to run with host load; the
+corpus and the quality figures are reproducible.
 
 ---
 
@@ -580,7 +605,7 @@ semantic p50); the corpus and the quality figures are reproducible.
 
 ```bash
 pip install -r requirements.txt
-python -m pytest              # 460 passed, 6 skipped, ~10 s — no model, no network
+python -m pytest              # 483 passed, 6 skipped, ~11 s — no model, no network
 python -m pytest --runslow    # + 6 integration tests against the real model
 ```
 
@@ -636,12 +661,8 @@ following are written but **unverified** and must be checked by hand:
 
 ## Roadmap
 
-- **Reuse a persistent `SemanticSearcher`** in `HybridSearchBackend` and the CLI
-  so the decoded index is built once, not per query (the benchmark shows this is
-  where the ~213 ms semantic p50 goes).
 - **Optional ANN index** (FAISS/Chroma) behind the existing `VectorIndex` seam for
   corpora beyond ~50k entries.
-- **Re-embed on model change** — a `reindex --force` that recomputes vectors.
 - **Windows/Linux packaging** (installer + tray behaviour) and a Windows CI smoke
   test for the UI.
 - **Notarised macOS build** (Developer ID + hardened runtime).
@@ -670,7 +691,8 @@ following are written but **unverified** and must be checked by hand:
 - **Numbers and very short entries are never embedded** — keyword search still
   finds them.
 - **`min_score` is a global threshold** tuned for `all-MiniLM-L6-v2`; changing
-  the model needs re-tuning. Scores are not calibrated probabilities.
+  the model needs re-tuning (the benchmark shows `all-mpnet-base-v2` scores
+  differently). Scores are not calibrated probabilities.
 - **Brute-force vector search does not scale forever.** Every query needs the
   whole matrix in memory (~75 MB at 50k entries) and — currently — decodes it
   after any change. Fine to ~50k entries; see the roadmap.
@@ -728,7 +750,7 @@ clipmind/
 │   ├── __main__.py           # `python -m clipmind`
 │   ├── capture/              # detect, monitor, processor, source_app, cli
 │   ├── storage/              # db.py (schema, FTS5, dedup), models.py
-│   ├── embeddings/           # codec, encoder (lazy MiniLM), service (worker)
+│   ├── embeddings/           # codec, encoder (lazy model), service (worker)
 │   ├── search/               # vector_index, semantic, keyword, hybrid, timeparse
 │   ├── privacy/              # detectors, policy
 │   └── ui/                   # view_model, search_backend, hotkey,
@@ -757,7 +779,7 @@ clipmind/
 
 **Verified in the development environment** (macOS 26.6.2, Intel, Python 3.12.15):
 
-- the full fast test suite (**460 passed, 6 skipped**), the offscreen app wiring
+- the full fast test suite (**483 passed, 6 skipped**), the offscreen app wiring
   (`clipmind app --check`), cross-process single-instance locking, and clean
   shutdown on `SIGINT`/`SIGTERM` (exit 0, lock released, no traceback);
 - the benchmark numbers above, measured with the real model;
@@ -785,4 +807,4 @@ clipmind/
 
 MIT — see [`LICENSE`](LICENSE). Third-party components keep their own licenses
 (PySide6/LGPL, PyTorch/BSD, `sentence-transformers`/Apache-2.0, the
-`all-MiniLM-L6-v2` model weights/Apache-2.0).
+`all-mpnet-base-v2` model weights/Apache-2.0).

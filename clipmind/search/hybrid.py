@@ -158,6 +158,55 @@ class HybridSearcher:
         self.semantic = SemanticSearcher(db, embedder=embedder, config=self.config)
         self.keyword = KeywordSearcher(db, config=self.config)
 
+    def search_time_aware(
+        self,
+        query: str,
+        top_k: Optional[int] = None,
+        *,
+        content_type: Optional[str] = None,
+        min_score: Optional[float] = None,
+        semantic_weight: Optional[float] = None,
+        keyword_weight: Optional[float] = None,
+        semantic_only: bool = False,
+        keyword_only: bool = False,
+        now: Optional[datetime] = None,
+    ) -> HybridOutcome:
+        """Parse a time phrase out of ``query``, then run a hybrid search.
+
+        This is the end-to-end path used by the CLI and the UI. Unlike
+        :meth:`search` (which takes already-cleaned text and explicit bounds), it
+        splits the time phrase off the query and applies the resulting window as
+        a pre-filter, keeping the parsed :class:`TimeQuery` on the outcome.
+
+        Reusing one :class:`HybridSearcher` for repeated calls is what lets the
+        semantic index survive between queries; constructing a fresh searcher per
+        query would rebuild it every time.
+        """
+        time_query = parse_time_query(query, now=now, config=self.config)
+        outcome = self.search(
+            time_query.cleaned_query,
+            top_k,
+            content_type=content_type,
+            since=time_query.start,
+            until=time_query.end,
+            min_score=min_score,
+            semantic_weight=semantic_weight,
+            keyword_weight=keyword_weight,
+            semantic_only=semantic_only,
+            keyword_only=keyword_only,
+        )
+        return HybridOutcome(
+            query=time_query,
+            results=outcome.results,
+            threshold=outcome.threshold,
+            index_size=outcome.index_size,
+            best_final=outcome.best_final,
+            used_semantic=outcome.used_semantic,
+            used_keyword=outcome.used_keyword,
+            time_only=outcome.time_only,
+            notes=outcome.notes,
+        )
+
     def search(
         self,
         query: str,
@@ -379,28 +428,15 @@ def hybrid_search(
         :class:`~clipmind.search.timeparse.TimeQuery`.
     """
     config = config or Config()
-    time_query = parse_time_query(query, now=now, config=config)
     searcher = HybridSearcher(db, embedder=embedder, config=config)
-    outcome = searcher.search(
-        time_query.cleaned_query,
+    return searcher.search_time_aware(
+        query,
         top_k,
         content_type=content_type,
-        since=time_query.start,
-        until=time_query.end,
         min_score=min_score,
         semantic_weight=semantic_weight,
         keyword_weight=keyword_weight,
         semantic_only=semantic_only,
         keyword_only=keyword_only,
-    )
-    return HybridOutcome(
-        query=time_query,
-        results=outcome.results,
-        threshold=outcome.threshold,
-        index_size=outcome.index_size,
-        best_final=outcome.best_final,
-        used_semantic=outcome.used_semantic,
-        used_keyword=outcome.used_keyword,
-        time_only=outcome.time_only,
-        notes=outcome.notes,
+        now=now,
     )

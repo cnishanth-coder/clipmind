@@ -62,6 +62,16 @@ def test_reindex_quiet_suppresses_progress(db_path, capsys) -> None:
     assert "/3" not in capsys.readouterr().out
 
 
+def test_reindex_force_reembeds_rows_that_already_have_vectors(db_path, capsys) -> None:
+    main(["--db", db_path, "reindex"])
+    capsys.readouterr()
+
+    assert main(["--db", db_path, "reindex", "--force"]) == 0
+    out = capsys.readouterr().out
+    assert "Force reindex: scanned 3 entr(y/ies)" in out
+    assert "Embedded 3, failed 0" in out
+
+
 def test_stats_reports_embedded_count(db_path, capsys) -> None:
     capsys.readouterr()
     main(["--db", db_path, "reindex"])

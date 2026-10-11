@@ -20,7 +20,7 @@ from typing import Optional, Sequence
 
 from ..config import Config
 from ..embeddings.encoder import Embedder, EmbeddingModelUnavailable
-from ..search.hybrid import HybridOutcome, HybridResult, HybridSearcher, hybrid_search
+from ..search.hybrid import HybridOutcome, HybridResult, HybridSearcher
 from ..storage.db import Database
 from .view_model import ResultItem, SearchOutcome, SearchRequest, result_items_from_records
 
@@ -89,6 +89,11 @@ class HybridSearchBackend:
         self._embedder = embedder
         self._config = config or Config()
         self._clipboard = clipboard
+        # One long-lived searcher: its semantic index is built once and kept in
+        # sync with the database, so per-keystroke searches do not rebuild it.
+        self._searcher = HybridSearcher(
+            db, embedder=self._embedder, config=self._config
+        )
 
     def run_search(self, request: SearchRequest) -> SearchOutcome:
         """Run one search and never raise for an expected failure.
@@ -129,21 +134,16 @@ class HybridSearchBackend:
 
         if request.ignore_time:
             # The user dismissed the time chip: treat the phrase as plain text.
-            hybrid = HybridSearcher(
-                self._db, embedder=self._embedder, config=self._config
-            ).search(
+            hybrid = self._searcher.search(
                 query,
                 top_k=request.top_k,
                 content_type=request.content_type,
             )
             return self._to_outcome(hybrid, time_label=None)
 
-        outcome = hybrid_search(
-            self._db,
+        outcome = self._searcher.search_time_aware(
             query,
             top_k=request.top_k,
-            embedder=self._embedder,
-            config=self._config,
             content_type=request.content_type,
         )
         return self._to_outcome(outcome)

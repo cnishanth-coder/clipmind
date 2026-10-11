@@ -8,9 +8,10 @@ Build with ``scripts/build_macos.sh`` (recommended) or directly::
 Environment switches:
 
 ``CLIPMIND_BUNDLE_MODEL=1``
-    Bundle the ``all-MiniLM-L6-v2`` snapshot inside the app (see
+    Bundle the default model snapshot (``all-MiniLM-L6-v2``) inside the app (see
     ``packaging/clipmind_launcher.py`` for the ``HF_HOME`` wiring). Off by
-    default: the app downloads the model once on first run instead.
+    default: the app downloads the model once on first run instead. Override the
+    model with ``CLIPMIND_BUNDLE_MODEL_NAME``.
 
 Notes:
     * ``console=False`` + ``LSUIElement`` make this a menu-bar-only app.
@@ -35,6 +36,10 @@ BUNDLE_ID = "com.clipmind.app"
 ICON = ROOT / "packaging" / "ClipMind.icns"
 
 BUNDLE_MODEL = os.environ.get("CLIPMIND_BUNDLE_MODEL") == "1"
+# Keep in sync with clipmind.config.DEFAULT_EMBEDDING_MODEL.
+BUNDLE_MODEL_NAME = os.environ.get(
+    "CLIPMIND_BUNDLE_MODEL_NAME", "all-MiniLM-L6-v2"
+)
 
 # --------------------------------------------------------------------- analysis
 
@@ -66,15 +71,20 @@ if BUNDLE_MODEL:
     hf_home = Path(
         os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")
     )
-    snapshot = hf_home / "hub" / "models--sentence-transformers--all-MiniLM-L6-v2"
+    # Bare names resolve under sentence-transformers' own org in the HF cache.
+    _repo_id = BUNDLE_MODEL_NAME if "/" in BUNDLE_MODEL_NAME else (
+        "sentence-transformers/" + BUNDLE_MODEL_NAME
+    )
+    repo_dir = "models--" + _repo_id.replace("/", "--")
+    snapshot = hf_home / "hub" / repo_dir
     if not snapshot.is_dir():
         raise SystemExit(
             f"CLIPMIND_BUNDLE_MODEL=1 but {snapshot} is missing. Download the "
             "model once (e.g. `python -c \"from sentence_transformers import "
-            "SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')\"`) "
+            f"SentenceTransformer; SentenceTransformer('{BUNDLE_MODEL_NAME}')\"`) "
             "or unset CLIPMIND_BUNDLE_MODEL."
         )
-    datas.append((str(snapshot), "clipmind_hf/hub/models--sentence-transformers--all-MiniLM-L6-v2"))
+    datas.append((str(snapshot), f"clipmind_hf/hub/{repo_dir}"))
 
 # Keep the bundle from pulling in unrelated heavy packages.
 excludes = [

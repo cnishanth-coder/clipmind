@@ -6,6 +6,7 @@ weighted fusion of the two, and a deterministic time-phrase parser.
 
 from __future__ import annotations
 
+from .embedding_index import EmbeddingIndex
 from .hybrid import HybridOutcome, HybridResult, HybridSearcher, hybrid_search
 from .keyword import KeywordHit, KeywordSearcher, keyword_search, sanitize_fts_query
 from .semantic import SearchResult, SemanticSearcher, search_semantic
@@ -16,6 +17,7 @@ __all__ = [
     "HybridOutcome",
     "HybridResult",
     "HybridSearcher",
+    "EmbeddingIndex",
     "KeywordHit",
     "KeywordSearcher",
     "NumpyVectorIndex",

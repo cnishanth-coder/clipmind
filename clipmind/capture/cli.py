@@ -182,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Texts per forward pass (default: {Config().embedding_batch_size}).",
     )
     reindex.add_argument(
+        "--force", action="store_true",
+        help="Re-embed every entry, not just those missing a vector "
+             "(required after changing embedding_model).",
+    )
+    reindex.add_argument(
         "--quiet", action="store_true", help="Suppress per-batch progress output.",
     )
 
@@ -536,7 +541,11 @@ def cmd_reindex(args: argparse.Namespace, config: Config) -> int:
         with Database(config=config) as db:
             before = db.count()
             report = reindex_pending(
-                db, config=config, progress=progress, batch_size=args.batch
+                db,
+                config=config,
+                progress=progress,
+                batch_size=args.batch,
+                force=args.force,
             )
             db_path = db.path
     except EmbeddingModelUnavailable as exc:
@@ -544,10 +553,16 @@ def cmd_reindex(args: argparse.Namespace, config: Config) -> int:
         return 1
 
     print(f"Database: {db_path}")
-    print(
-        f"Scanned {before} entr(y/ies): {report.missing} without embeddings "
-        f"({report.eligible} eligible, {report.skipped} skipped as too short/typed)."
-    )
+    if report.forced:
+        print(
+            f"Force reindex: scanned {report.missing} entr(y/ies) "
+            f"({report.eligible} eligible, {report.skipped} skipped as too short/typed)."
+        )
+    else:
+        print(
+            f"Scanned {before} entr(y/ies): {report.missing} without embeddings "
+            f"({report.eligible} eligible, {report.skipped} skipped as too short/typed)."
+        )
     print(
         f"Embedded {report.embedded}, failed {report.failed} in {report.seconds:.1f}s."
     )

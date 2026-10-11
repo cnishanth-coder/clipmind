@@ -1,7 +1,8 @@
 """Serialisation helpers for embedding vectors.
 
 Embeddings are stored in the existing ``items.embedding`` BLOB column as raw
-little-endian ``float32`` bytes (384 * 4 = 1536 bytes for ``all-MiniLM-L6-v2``).
+little-endian ``float32`` bytes (384 * 4 = 1536 bytes for ``all-MiniLM-L6-v2``;
+768 * 4 = 3072 for ``all-mpnet-base-v2``).
 Raw ``float32`` is used rather than ``numpy.save``/``.npy`` because it needed no
 header, is trivially portable, and keeps the database readable from any language.
 """
