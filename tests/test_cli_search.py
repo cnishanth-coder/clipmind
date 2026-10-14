@@ -9,6 +9,7 @@ loading torch or touching the network.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -21,6 +22,16 @@ DOCS = [
     "https://react.dev/reference/react/hooks",
     "meeting at 5pm with Rahul",
 ]
+
+#: ``reindex`` prints one progress line per batch as ``"  <done>/<total>"``.
+#: Match the whole line rather than the bare ``"/3"`` substring, which also
+#: occurs in the temp database path on some runners (e.g. ``/private/var/...``).
+_PROGRESS_LINE = re.compile(r"^\s*(\d+)/(\d+)\s*$")
+
+
+def _progress_lines(text: str) -> list[str]:
+    """Return the ``done/total`` progress lines found in ``text``."""
+    return [line for line in text.splitlines() if _PROGRESS_LINE.match(line)]
 
 
 @pytest.fixture()
@@ -57,9 +68,19 @@ def test_reindex_is_idempotent_from_the_cli(db_path, capsys) -> None:
     assert "Embedded 0, failed 0" in out
 
 
+def test_reindex_prints_progress_without_quiet(db_path, capsys) -> None:
+    assert main(["--db", db_path, "reindex"]) == 0
+    lines = _progress_lines(capsys.readouterr().out)
+    assert lines, "reindex should print at least one done/total progress line"
+    assert lines[-1].strip() == "3/3"
+
+
 def test_reindex_quiet_suppresses_progress(db_path, capsys) -> None:
-    main(["--db", db_path, "reindex", "--quiet"])
-    assert "/3" not in capsys.readouterr().out
+    assert main(["--db", db_path, "reindex", "--quiet"]) == 0
+    out = capsys.readouterr().out
+    assert _progress_lines(out) == []
+    # The summary still prints, so an empty run cannot pass as "suppressed".
+    assert "Embedded 3, failed 0" in out
 
 
 def test_reindex_force_reembeds_rows_that_already_have_vectors(db_path, capsys) -> None:

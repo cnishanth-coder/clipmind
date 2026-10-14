@@ -18,6 +18,15 @@ from pathlib import Path
 #: Filename used inside the data directory.
 LOCK_FILENAME = "app.lock"
 
+#: Byte offset used for the Windows byte-range lock. Windows does not have
+#: ``flock``, so :func:`msvcrt.locking` locks a byte range instead of the whole
+#: file - and a locked range cannot be read through another handle. The pid is
+#: written at offset 0, so the lock is taken far past it: a second instance can
+#: then always read the holder's pid before reporting "already running". Range
+#: locks may extend past EOF (documented for ``msvcrt.locking``), so the file
+#: never needs to be padded. POSIX keeps locking the whole file with ``flock``.
+_LOCK_OFFSET = 1 << 30
+
 
 class SingleInstanceLock:
     """Advisory, non-blocking file lock used to enforce one ClipMind process.
@@ -46,7 +55,10 @@ class SingleInstanceLock:
         try:
             self._lock_handle(handle)
         except OSError:
-            pid = self._read_pid(handle)
+            try:
+                pid = self._read_pid(handle)
+            except Exception:  # never let a bad lock file block the second launch
+                pid = 0
             handle.close()
             return pid
         # We own the lock: record our pid for the next caller's message.
@@ -91,11 +103,16 @@ class SingleInstanceLock:
 
     @staticmethod
     def _lock_handle(handle) -> None:
-        """Take an exclusive, non-blocking lock on ``handle``."""
+        """Take an exclusive, non-blocking lock on ``handle``.
+
+        POSIX locks the whole file; Windows locks one byte at
+        :data:`_LOCK_OFFSET`, past the pid text, so the holder's pid stays
+        readable by another process.
+        """
         if os.name == "nt":  # pragma: no cover - exercised only on Windows
             import msvcrt
 
-            handle.seek(0)
+            handle.seek(_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
@@ -108,7 +125,7 @@ class SingleInstanceLock:
         if os.name == "nt":  # pragma: no cover - exercised only on Windows
             import msvcrt
 
-            handle.seek(0)
+            handle.seek(_LOCK_OFFSET)
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
