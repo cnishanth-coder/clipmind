@@ -12,7 +12,7 @@ No account, no cloud, no telemetry. The only network access it ever performs is
 the one-time download of the ~90 MB embedding model.
 
 **Version 0.6.0** · MIT licensed · macOS first (menu-bar app), Windows/Linux CLI
-+ UI code paths included but less exercised (see [Limitations](#limitations)).
++ macOS app manually tested; Windows/Linux are CLI-first and UI is untested there (see [Limitations](#limitations)).
 
 ---
 
@@ -55,6 +55,28 @@ the one-time download of the ~90 MB embedding model.
 ---
 
 ## Install & run
+
+### Option 1: Download the macOS app
+
+1. Download `ClipMind.zip` (or the `.dmg`) from the
+   [Releases](https://github.com/cnishanth-coder/clipmind/releases) page.
+2. Unzip it and move `ClipMind.app` into `/Applications`.
+3. Right-click `ClipMind.app` and choose **Open**, then confirm **Open** in the
+   warning. The app is unsigned, so Gatekeeper blocks a plain double-click the
+   first time.
+4. Grant **ClipMind** access to **Accessibility** and **Input Monitoring** in
+   **System Settings → Privacy & Security**. If ClipMind is not listed, add it
+   with the **+** button.
+5. The first launch downloads the `all-MiniLM-L6-v2` model (~90 MB); capture and
+   keyword search work while it downloads, and everything is offline afterwards.
+6. Press `Cmd+Shift+V` to open the popup.
+
+> **Troubleshooting.** If the hotkey does nothing, remove ClipMind from both
+> permission lists (**Accessibility** and **Input Monitoring**) and add it again
+> with the **+** button, then restart the app. A rebuilt unsigned app must be
+> granted these permissions again.
+
+### Option 2: Run from source
 
 Requires **Python 3.11+** (3.12 is what this repo is developed and tested on).
 
@@ -101,53 +123,47 @@ See [Usage](#usage) for the full command reference and
 ```mermaid
 flowchart TB
     CLIP["System clipboard"]
-    HOTKEY["Global hotkey<br/>Cmd+Shift+V"]
-    TRAY["Menu-bar tray icon"]
+    HOTKEY["Global hotkey Cmd+Shift+V"]
+    TRAY["Tray icon"]
 
-    subgraph capture["capture/ — never blocks on the model"]
-        MON["monitor.py<br/>poll + baseline + dedup"]
-        PROC["processor.py<br/>normalize → truncate → hash"]
-        DET["detect.py<br/>url / email / number / code / text"]
+    subgraph capture["capture and privacy"]
+        MON["monitor.py"]
+        PROC["processor.py"]
+        DET["detect.py"]
+        POLICY["policy.py"]
     end
 
-    subgraph privacy["privacy/"]
-        POLICY["policy.py<br/>skip / mask secrets,<br/>source-app ignore list"]
+    DB["db.py - SQLite WAL and FTS5"]
+
+    subgraph search["search and embeddings"]
+        SVC["service.py"]
+        ENC["encoder.py"]
+        SEM["semantic.py"]
+        KW["keyword.py"]
+        HYB["hybrid.py"]
+        TIME["timeparse.py"]
     end
 
-    DB[("storage/db.py<br/>SQLite (WAL)<br/>items + items_fts (FTS5)")]
-
-    subgraph emb["embeddings/"]
-        SVC["service.py<br/>queue + worker thread"]
-        ENC["encoder.py<br/>all-MiniLM-L6-v2 (384d), lazy"]
-    end
-
-    subgraph search["search/"]
-        SEM["semantic.py<br/>cosine over VectorIndex"]
-        KW["keyword.py<br/>FTS5 BM25"]
-        HYB["hybrid.py<br/>final = 0.7·sem + 0.3·kw·coverage"]
-        TIME["timeparse.py<br/>phrase → local date window"]
-    end
-
-    subgraph ui["ui/ — Qt only here"]
-        VM["view_model.py<br/>display-free controller"]
-        POP["popup.py<br/>frameless search window"]
+    subgraph ui["ui"]
+        VM["view_model.py"]
+        POP["popup.py"]
         BEND["search_backend.py"]
-        APP["app.py<br/>one process, one lock"]
+        APP["app.py"]
     end
 
     CLIP --> MON --> PROC --> DET --> POLICY --> DB
     DB --> SVC --> ENC
-    ENC -. writes float32 BLOBs .-> DB
+    ENC -.->|float32 BLOBs| DB
     HOTKEY --> APP
     TRAY --> APP
     APP --> POP
+    POP -.->|snapshots| VM
     VM --> BEND
     BEND --> TIME --> HYB
     HYB --> SEM
     HYB --> KW
     SEM --> DB
     KW --> DB
-    POP -. renders snapshots .-> VM
 ```
 
 Query flow:
@@ -155,21 +171,21 @@ Query flow:
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant P as Popup (debounced)
-    participant B as HybridSearchBackend
+    participant P as Popup
+    participant B as Backend
     participant T as timeparse
-    participant H as HybridSearcher
-    participant S as SemanticSearcher
-    participant K as KeywordSearcher
+    participant H as Hybrid
+    participant S as Semantic
+    participant K as Keyword
     U->>P: "react hooks yesterday"
-    P->>B: search (worker thread)
-    B->>T: parse_time_query()
-    T-->>B: cleaned="react hooks", [start, end)
-    B->>H: search(cleaned, since, until)
-    H->>S: cosine top-N  (w=0.7)
-    H->>K: FTS5 BM25 top-N  (w=0.3)
-    H-->>B: fused, ranked HybridOutcome
-    B-->>P: ResultItem rows (stale generations dropped)
+    P->>B: search
+    B->>T: parse time
+    T-->>B: "react hooks", range
+    B->>H: search
+    H->>S: cosine top-N
+    H->>K: BM25 top-N
+    H-->>B: fused ranked results
+    B-->>P: result rows
 ```
 
 ### Design decisions
